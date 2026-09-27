@@ -1,0 +1,7718 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import { 
+  LayoutGrid,
+  Grid2X2,
+  LayoutList,
+  List,
+  Layout, 
+  Search, 
+  Calendar, 
+  Archive as ArchiveIcon, 
+  Zap, 
+  Target, 
+  Clock, 
+  ChevronLeft,
+  ChevronRight,
+  Filter,
+  MoreVertical,
+  CheckCircle2,
+  Circle,
+  X,
+  Undo2,
+  Redo2,
+  ArrowRightLeft,
+  ArrowUpRight,
+  Trash2,
+  Settings as SettingsIcon,
+  Activity,
+  Download,
+  ExternalLink,
+  Upload,
+  FileText,
+  LogOut,
+  User as UserIcon,
+  LogIn,
+  AlertTriangle,
+  AlertCircle,
+  Link as LinkIcon,
+  ChevronDown,
+  ChevronRight as ChevronRightIcon,
+  Star,
+  StarOff,
+  Globe,
+  Languages,
+  PanelTop,
+  Plus,
+  Minus,
+  RefreshCcw,
+  Pin,
+  PinOff,
+  GripVertical,
+  Layers,
+  CalendarDays,
+  Lock,
+  ShieldAlert,
+  Repeat,
+  BookOpen
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { DragDropContext, Droppable, Draggable as DraggableDnd } from '@hello-pangea/dnd';
+const Draggable = DraggableDnd as any;
+import { 
+  format, 
+  differenceInDays, 
+  startOfMonth, 
+  endOfMonth, 
+  startOfWeek, 
+  endOfWeek, 
+  eachDayOfInterval, 
+  isSameMonth, 
+  isSameDay, 
+  addMonths, 
+  subMonths, 
+  addWeeks, 
+  subWeeks, 
+  addDays, 
+  subDays,
+  addYears,
+  subYears,
+  startOfYear,
+  endOfYear,
+  eachMonthOfInterval
+} from 'date-fns';
+import { ja, fr, enUS } from 'date-fns/locale';
+import { Category, Task, FolderMeta } from './types';
+import { cn, formatDate, tr } from './lib/utils';
+import { getParentFolderDeadline } from './lib/folderDeadlineUtils';
+import { isTaskOccurringOnDate } from './lib/taskDateUtils';
+import { auth, db, signIn, logOut } from './lib/firebase';
+import { onAuthStateChanged, User } from 'firebase/auth';
+import { AuthModal } from './components/AuthModal';
+import { SignInView } from './components/SignInView';
+import { TaskExplorerTree } from './components/TaskExplorerTree';
+import { ProjectTimelineView } from './components/ProjectTimelineView';
+import { TaskDetailPane } from './components/TaskDetailPane';
+import { TaskTabsDetail } from './components/TaskTabsDetail';
+import { FocusHeaderSection } from './components/FocusHeaderSection';
+import { ArchiveTrashExplorerView } from './components/ArchiveTrashExplorerView';
+import { UserGuideModal, useStandaloneReadmeHtmlUrl, downloadReadmeMarkdown, getReadmeFilenameByLang } from './components/UserGuideModal';
+import Papa from 'papaparse';
+import { 
+  collection, 
+  doc, 
+  onSnapshot, 
+  query, 
+  where, 
+  setDoc, 
+  deleteDoc, 
+  updateDoc, 
+  addDoc,
+  getDocs,
+  getDoc,
+  writeBatch,
+  deleteField
+} from 'firebase/firestore';
+
+// Add types for File System Access API
+declare global {
+  interface Window {
+    showDirectoryPicker: (options?: { mode?: 'read' | 'readwrite'; startIn?: string }) => Promise<FileSystemDirectoryHandle>;
+  }
+}
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+const THEME_CATEGORIES = [
+  { id: 'Urgent', label: 'Focus', icon: Zap, color: 'bg-red-50/50 border-red-100', accent: 'bg-red-500', text: 'text-red-700', badge: 'text-red-400 border-red-100', desc: '3 Slots' },
+  { id: 'Focus', label: 'ToDo', icon: Target, color: 'bg-indigo-50/50 border-indigo-100', accent: 'bg-indigo-500', text: 'text-indigo-700', badge: 'text-indigo-500', desc: 'Main' },
+];
+
+interface LocalBackupSlotInfo {
+  slot: 1 | 2 | 3;
+  fileName: string;
+  timestamp: number;
+  taskCount: number;
+  signature?: string;
+  writtenToDisk?: boolean;
+}
+
+function resolveDailyBackupSlot(
+  slotsMap: Record<1 | 2 | 3, LocalBackupSlotInfo | null>,
+  now: number = Date.now()
+): 1 | 2 | 3 {
+  const todayStr = format(new Date(now), 'yyyy-MM-dd');
+  try {
+    const savedActiveDate = localStorage.getItem('navfor_local_backup_active_date');
+    const savedActiveSlot = Number(localStorage.getItem('navfor_local_backup_active_slot'));
+    if (
+      savedActiveDate === todayStr &&
+      (savedActiveSlot === 1 || savedActiveSlot === 2 || savedActiveSlot === 3)
+    ) {
+      const slotOnDisk = slotsMap[savedActiveSlot as 1 | 2 | 3];
+      const anyOnDisk = Boolean(slotsMap[1] || slotsMap[2] || slotsMap[3]);
+      if (slotOnDisk || !anyOnDisk) {
+        return savedActiveSlot as 1 | 2 | 3;
+      }
+    }
+  } catch {}
+
+  let latestSlotInfo: LocalBackupSlotInfo | null = null;
+  for (const s of [1, 2, 3] as const) {
+    const info = slotsMap[s];
+    if (info && info.timestamp > (latestSlotInfo?.timestamp || 0)) {
+      latestSlotInfo = info;
+    }
+  }
+
+  if (latestSlotInfo) {
+    const latestDateStr = format(new Date(latestSlotInfo.timestamp), 'yyyy-MM-dd');
+    if (latestDateStr === todayStr) {
+      return latestSlotInfo.slot;
+    }
+    return ((latestSlotInfo.slot % 3) + 1) as 1 | 2 | 3;
+  }
+
+  try {
+    const savedActiveDate = localStorage.getItem('navfor_local_backup_active_date');
+    const savedActiveSlot = Number(localStorage.getItem('navfor_local_backup_active_slot'));
+    if (
+      savedActiveDate &&
+      savedActiveDate !== todayStr &&
+      (savedActiveSlot === 1 || savedActiveSlot === 2 || savedActiveSlot === 3)
+    ) {
+      return ((savedActiveSlot % 3) + 1) as 1 | 2 | 3;
+    }
+  } catch {}
+
+  return 1;
+}
+
+const IDB_NAME = 'navfor_local_sync_db';
+const IDB_STORE = 'handles';
+const IDB_KEY = 'backup_dir';
+
+async function saveDirHandleToIDB(handle: FileSystemDirectoryHandle): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE);
+        }
+      };
+      req.onsuccess = () => {
+        try {
+          const db = req.result;
+          const tx = db.transaction(IDB_STORE, 'readwrite');
+          tx.objectStore(IDB_STORE).put(handle, IDB_KEY);
+          tx.oncomplete = () => {
+            db.close();
+            resolve();
+          };
+          tx.onerror = () => {
+            db.close();
+            resolve();
+          };
+        } catch {
+          resolve();
+        }
+      };
+      req.onerror = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+async function loadDirHandleFromIDB(): Promise<FileSystemDirectoryHandle | null> {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE);
+        }
+      };
+      req.onsuccess = () => {
+        try {
+          const db = req.result;
+          const tx = db.transaction(IDB_STORE, 'readonly');
+          const getReq = tx.objectStore(IDB_STORE).get(IDB_KEY);
+          getReq.onsuccess = () => {
+            db.close();
+            resolve((getReq.result as FileSystemDirectoryHandle) || null);
+          };
+          getReq.onerror = () => {
+            db.close();
+            resolve(null);
+          };
+        } catch {
+          resolve(null);
+        }
+      };
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function clearDirHandleFromIDB(): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE);
+        }
+      };
+      req.onsuccess = () => {
+        try {
+          const db = req.result;
+          const tx = db.transaction(IDB_STORE, 'readwrite');
+          tx.objectStore(IDB_STORE).delete(IDB_KEY);
+          tx.oncomplete = () => {
+            db.close();
+            resolve();
+          };
+          tx.onerror = () => {
+            db.close();
+            resolve();
+          };
+        } catch {
+          resolve();
+        }
+      };
+      req.onerror = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+export default function App() {
+  const APP_VERSION = "3.1.11";
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [authModalError, setAuthModalError] = useState<any>(null);
+  const [isUserGuideOpen, setIsUserGuideOpen] = useState(false);
+
+  // Ensure legacy local mock/storage keys are completely purged
+  useEffect(() => {
+    try {
+      localStorage.removeItem('navfor_mode');
+      localStorage.removeItem('navfor_local_tasks');
+      localStorage.removeItem('navfor_local_settings');
+      localStorage.removeItem('focusflow_tasks');
+      localStorage.removeItem('focusflow_settings');
+    } catch {}
+  }, []);
+
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [folderMetas, setFolderMetas] = useState<Record<string, FolderMeta>>(() => {
+    try {
+      const saved = localStorage.getItem('navfor_folder_metas');
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      return {};
+    }
+  });
+  const [searchTerm, setSearchTerm] = useState('');
+  const [selectedProject, setSelectedProject] = useState<string>('All');
+  const [newTaskTitle, setNewTaskTitle] = useState('');
+  const [newTaskProject, setNewTaskProject] = useState('');
+  const [newTaskNotes, setNewTaskNotes] = useState('');
+  const [newTaskUrls, setNewTaskUrls] = useState<string[]>(['']);
+  const [newTaskDeadline, setNewTaskDeadline] = useState<string>('');
+  const [isTaskAllDay, setIsTaskAllDay] = useState(true);
+  const [newTaskUrl, setNewTaskUrl] = useState(''); // Compatibility check if still used in layout
+  const [isPickingDaily, setIsPickingDaily] = useState(false);
+  const [viewMode, setViewMode] = useState<'dashboard' | 'archive' | 'settings' | 'trash' | 'calendar'>('dashboard');
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [message, setMessage] = useState<{ text: string, type: 'error' | 'info' } | null>(null);
+  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
+  const [activeSection, setActiveSection] = useState<string>('General');
+  const [mobileView, setMobileView] = useState<'summary' | 'urgent' | 'focus' | 'calendar' | 'archive' | 'trash' | 'settings'>('urgent');
+
+  // Multi-tab and Explorer state
+  const [openTaskIds, setOpenTaskIds] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('navfor_open_tabs');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [activeTabTaskId, setActiveTabTaskId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('navfor_active_tab') || null;
+    } catch {
+      return null;
+    }
+  });
+  const [explorerWidth, setExplorerWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('navfor_explorer_width');
+      return saved ? Number(saved) : 310;
+    } catch {
+      return 310;
+    }
+  });
+  const [detailPaneWidth, setDetailPaneWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('navfor_detail_width');
+      return saved ? Number(saved) : 360;
+    } catch {
+      return 360;
+    }
+  });
+  const [isExplorerCollapsed, setIsExplorerCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('navfor_explorer_collapsed') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const handleToggleExplorerCollapse = () => {
+    setIsExplorerCollapsed(prev => {
+      const next = !prev;
+      try {
+        localStorage.setItem('navfor_explorer_collapsed', String(next));
+      } catch (e) {
+        console.error(e);
+      }
+      return next;
+    });
+  };
+
+  const handleDetailPaneWidthChange = (w: number) => {
+    setDetailPaneWidth(w);
+    try {
+      localStorage.setItem('navfor_detail_width', String(w));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const [isDetailPaneVisible, setIsDetailPaneVisible] = useState<boolean>(() => {
+    try {
+      if (typeof window !== 'undefined' && window.innerWidth < 1024) return false;
+      return localStorage.getItem('navfor_detail_visible') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+
+  // Detect mobile landscape viewport (width > height on mobile screens with short height)
+  const isMobileLandscapeViewport = () =>
+    typeof window !== 'undefined' &&
+    window.innerWidth > window.innerHeight &&
+    window.innerHeight <= 540;
+
+  const [isTimelineFullscreen, setIsTimelineFullscreen] = useState<boolean>(() => isMobileLandscapeViewport());
+  const wasMobileLandscapeRef = useRef<boolean>(isMobileLandscapeViewport());
+
+  useEffect(() => {
+    if (isMobileLandscapeViewport() && viewMode === 'dashboard') {
+      setMobileView('focus');
+      setIsDetailPaneVisible(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const handleOrientationOrResize = () => {
+      const nowLandscape = isMobileLandscapeViewport();
+      if (nowLandscape && !wasMobileLandscapeRef.current) {
+        if (viewMode === 'dashboard') {
+          setMobileView('focus');
+          setIsTimelineFullscreen(true);
+          setIsDetailPaneVisible(false);
+        }
+      } else if (!nowLandscape && wasMobileLandscapeRef.current) {
+        setIsTimelineFullscreen(false);
+      }
+      wasMobileLandscapeRef.current = nowLandscape;
+    };
+
+    window.addEventListener('resize', handleOrientationOrResize);
+    window.addEventListener('orientationchange', handleOrientationOrResize);
+    return () => {
+      window.removeEventListener('resize', handleOrientationOrResize);
+      window.removeEventListener('orientationchange', handleOrientationOrResize);
+    };
+  }, [viewMode]);
+
+  const isEffectiveTimelineFullscreen = Boolean(user && viewMode === 'dashboard' && isTimelineFullscreen);
+
+  const handleToggleTimelineFullscreen = () => {
+    setIsTimelineFullscreen(prev => {
+      const next = !prev;
+      if (next) {
+        setMobileView('focus');
+        setIsDetailPaneVisible(false);
+      }
+      return next;
+    });
+  };
+
+  const handleMinimizeDetailPane = () => {
+    setIsDetailPaneVisible(false);
+    try {
+      localStorage.setItem('navfor_detail_visible', 'false');
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleExpandDetailPane = () => {
+    setIsDetailPaneVisible(true);
+    try {
+      localStorage.setItem('navfor_detail_visible', 'true');
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('navfor_open_tabs', JSON.stringify(openTaskIds));
+      if (activeTabTaskId) {
+        localStorage.setItem('navfor_active_tab', activeTabTaskId);
+      } else {
+        localStorage.removeItem('navfor_active_tab');
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }, [openTaskIds, activeTabTaskId]);
+
+  const [lastOpenEvent, setLastOpenEvent] = useState<{ taskId: string; isPermanent: boolean; timestamp: number } | null>(null);
+
+  const handleOpenTaskInTab = (taskId: string, isPermanent = false) => {
+    if (!taskId) return;
+    setLastOpenEvent({ taskId, isPermanent, timestamp: Date.now() });
+    setOpenTaskIds(prev => {
+      if (prev.includes(taskId)) return prev;
+      return [...prev, taskId];
+    });
+    setActiveTabTaskId(taskId);
+    setIsDetailPaneVisible(true);
+    try {
+      localStorage.setItem('navfor_detail_visible', 'true');
+    } catch (e) {
+      console.error(e);
+    }
+    if (viewMode !== 'dashboard' && viewMode !== 'archive' && viewMode !== 'trash') {
+      setViewMode('dashboard');
+    }
+    if (viewMode === 'dashboard' && window.innerWidth < 1024) {
+      setMobileView('focus');
+    }
+  };
+
+  const handleCloseTaskTab = (taskId: string) => {
+    setOpenTaskIds(prev => {
+      const next = prev.filter(id => id !== taskId);
+      if (activeTabTaskId === taskId) {
+        const idx = prev.indexOf(taskId);
+        const nextActive = next[idx] || next[idx - 1] || null;
+        setActiveTabTaskId(nextActive);
+      }
+      return next;
+    });
+  };
+
+  const handleCloseAllTabs = () => {
+    setOpenTaskIds([]);
+    setActiveTabTaskId(null);
+    setIsDetailPaneVisible(false);
+    try {
+      localStorage.setItem('navfor_open_tabs', '[]');
+      localStorage.removeItem('navfor_active_tab');
+      localStorage.setItem('navfor_detail_visible', 'false');
+      const emptyPanes = [
+        { id: 0, openTaskIds: [], activeTaskId: null, previewTaskId: null },
+        { id: 1, openTaskIds: [], activeTaskId: null, previewTaskId: null },
+        { id: 2, openTaskIds: [], activeTaskId: null, previewTaskId: null },
+        { id: 3, openTaskIds: [], activeTaskId: null, previewTaskId: null },
+      ];
+      localStorage.setItem('navfor_editor_panes', JSON.stringify(emptyPanes));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleExplorerWidthChange = (w: number) => {
+    setExplorerWidth(w);
+    try {
+      localStorage.setItem('navfor_explorer_width', String(w));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleCreateTaskDirect = async (taskData: {
+    title: string;
+    project: string;
+    deadline?: number;
+    isAllDay?: boolean;
+    notes?: string;
+    timelineColumn?: string;
+    timelineStep?: number;
+    timelinePresetColumns?: Record<string, string>;
+    order?: number;
+  }) => {
+    if (!user) {
+      setIsAuthModalOpen(true);
+      return;
+    }
+    const newTask: any = {
+      userId: user.uid,
+      title: taskData.title.trim(),
+      project: taskData.project.trim() || 'General',
+      notes: taskData.notes || '',
+      urls: [],
+      section: activeSection,
+      category: 'Focus' as Category,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      isDone: false,
+      isStarred: false,
+      isAllDay: taskData.isAllDay ?? true,
+      ...(taskData.deadline ? { deadline: taskData.deadline } : {}),
+      ...(taskData.timelineColumn ? { timelineColumn: taskData.timelineColumn } : {}),
+      ...(taskData.timelineStep !== undefined ? { timelineStep: taskData.timelineStep } : {}),
+      ...(taskData.timelinePresetColumns ? { timelinePresetColumns: taskData.timelinePresetColumns } : {}),
+      ...(taskData.order !== undefined ? { order: taskData.order } : {})
+    };
+
+    try {
+      pushToHistory();
+      let newId = '';
+      if (user) {
+        const docRef = await addDoc(collection(db, 'tasks'), newTask);
+        newId = docRef.id;
+      } else {
+        newId = 'local_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+        const created: Task = { id: newId, ...newTask };
+        syncLocalTasks([created, ...tasks]);
+      }
+      handleOpenTaskInTab(newId);
+      setMessage({ text: L("タスクを追加しました。", "Task added.", "Tâche ajoutée."), type: 'info' });
+    } catch (err) {
+      if (user) {
+        handleFirestoreError(err, OperationType.CREATE, 'tasks');
+      }
+    }
+  };
+
+  const handleDuplicateTask = async (task: Task, targetProject?: string) => {
+    const copySuffix = L(' (コピー)', ' (Copy)', ' (Copie)');
+    await handleCreateTaskDirect({
+      title: `${task.title}${copySuffix}`,
+      project: targetProject || task.project,
+      notes: task.notes,
+      deadline: task.deadline,
+      isAllDay: task.isAllDay,
+      timelineColumn: task.timelineColumn,
+      timelineStep: task.timelineStep,
+      timelinePresetColumns: task.timelinePresetColumns
+    });
+  };
+
+  const handleDuplicateFolder = async (folderPath: string) => {
+    if (!folderPath) return;
+    const copySuffix = L(' (コピー)', ' (Copy)', ' (Copie)');
+    const newFolderPath = `${folderPath}${copySuffix}`;
+    const isInsideFolder = (p: string) => p === folderPath || p.startsWith(folderPath + '/');
+    const tasksToCopy = tasks.filter(t => t.category !== 'Trash' && isInsideFolder(t.project));
+    const now = Date.now();
+
+    pushToHistory();
+
+    if (user) {
+      try {
+        const batch = writeBatch(db);
+        tasksToCopy.forEach(t => {
+          const updatedProject = t.project === folderPath
+            ? newFolderPath
+            : newFolderPath + t.project.slice(folderPath.length);
+          const newDocRef = doc(collection(db, 'tasks'));
+          const newTaskData: Record<string, any> = {
+            userId: user.uid,
+            title: t.title,
+            project: updatedProject,
+            notes: t.notes || '',
+            urls: t.urls || [],
+            section: t.section || activeSection,
+            category: (t.category === 'Urgent' ? 'Focus' : t.category) as Category,
+            createdAt: now,
+            updatedAt: now,
+            isDone: t.isDone || false,
+            isStarred: t.isStarred || false,
+            isPinned: false,
+            isAllDay: t.isAllDay ?? true,
+            ...(t.deadline !== undefined ? { deadline: t.deadline } : {}),
+            ...(t.startDate !== undefined ? { startDate: t.startDate } : {}),
+            ...(t.timelineColumn !== undefined ? { timelineColumn: t.timelineColumn } : {}),
+            ...(t.timelineStep !== undefined ? { timelineStep: t.timelineStep } : {}),
+            ...(t.timelinePresetColumns !== undefined ? { timelinePresetColumns: t.timelinePresetColumns } : {}),
+            ...(t.order !== undefined ? { order: t.order } : {}),
+            ...(t.recurrence !== undefined ? { recurrence: sanitizeForFirestore(t.recurrence) } : {})
+          };
+          batch.set(newDocRef, newTaskData);
+        });
+        await batch.commit();
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, 'tasks');
+      }
+    } else {
+      const copiedTasks: Task[] = tasksToCopy.map((t, idx) => {
+        const updatedProject = t.project === folderPath
+          ? newFolderPath
+          : newFolderPath + t.project.slice(folderPath.length);
+        return {
+          ...t,
+          id: `local_${now}_${idx}_${Math.random().toString(36).substring(2, 8)}`,
+          project: updatedProject,
+          category: (t.category === 'Urgent' ? 'Focus' : t.category) as Category,
+          isPinned: false,
+          createdAt: now,
+          updatedAt: now
+        };
+      });
+      syncLocalTasks([...copiedTasks, ...tasks]);
+    }
+
+    // Also update custom folders in localStorage so empty or nested custom folders are duplicated
+    try {
+      const storageKey = `navfor_folders_${activeSection}`;
+      const saved = localStorage.getItem(storageKey);
+      const currentFolders: string[] = saved ? JSON.parse(saved) : [];
+      const additionalFolders = [newFolderPath];
+      currentFolders.forEach(f => {
+        if (f.startsWith(folderPath + '/')) {
+          additionalFolders.push(newFolderPath + f.slice(folderPath.length));
+        }
+      });
+      const merged = Array.from(new Set([...currentFolders, ...additionalFolders]));
+      localStorage.setItem(storageKey, JSON.stringify(merged));
+      window.dispatchEvent(new Event('navfor_folders_updated'));
+    } catch {}
+
+    setMessage({
+      text: L(
+        `フォルダ「${folderPath}」を複製しました。`,
+        `Duplicated folder "${folderPath}".`,
+        `Dossier « ${folderPath} » dupliqué.`
+      ),
+      type: 'info'
+    });
+  };
+  
+  // Track swipe cooldown
+  const lastSwipeTime = React.useRef(0);
+  const touchStart = React.useRef({ x: 0, y: 0 });
+  const accumulatedX = React.useRef(0);
+  const swipeLocked = React.useRef(false);
+  const lockTimer = React.useRef<NodeJS.Timeout | null>(null);
+
+  const handleSwipe = (direction: 'left' | 'right') => {
+    const now = Date.now();
+    // クールダウン時間を少し短めに設定 (PCの操作感を考慮)
+    if (now - lastSwipeTime.current < 350) return;
+    lastSwipeTime.current = now;
+    accumulatedX.current = 0;
+
+    const modes: ('dashboard' | 'archive' | 'trash' | 'calendar' | 'settings')[] = ['dashboard', 'calendar', 'archive', 'trash', 'settings'];
+    const currentIndex = modes.indexOf(viewMode);
+    
+    const mobileViews: ('summary' | 'urgent' | 'focus' | 'calendar' | 'archive' | 'trash' | 'settings')[] = ['summary', 'urgent', 'focus', 'calendar', 'archive', 'trash', 'settings'];
+    const currentMobileIndex = mobileViews.indexOf(mobileView as any);
+
+    if (window.innerWidth >= 1024) {
+      if (direction === 'right' && currentIndex > 0) setViewMode(modes[currentIndex - 1]);
+      if (direction === 'left' && currentIndex < modes.length - 1) setViewMode(modes[currentIndex + 1]);
+    } else {
+      if (mobileView === 'calendar' || viewMode === 'calendar' || viewMode === 'dashboard') return;
+      if (direction === 'right' && currentMobileIndex > 0) setMobileView(mobileViews[currentMobileIndex - 1] as any);
+      if (direction === 'left' && currentMobileIndex < mobileViews.length - 1) setMobileView(mobileViews[currentMobileIndex + 1] as any);
+      
+      const nextIndex = direction === 'right' ? currentMobileIndex - 1 : currentMobileIndex + 1;
+      if (nextIndex >= 0 && nextIndex < mobileViews.length) {
+        const mv = mobileViews[nextIndex];
+        if (mv === 'calendar') setViewMode('calendar');
+        else if (mv === 'archive') setViewMode('archive');
+        else if (mv === 'trash') setViewMode('trash');
+        else if (mv === 'settings') setViewMode('settings');
+        else setViewMode('dashboard');
+      }
+    }
+  };
+
+  useEffect(() => {
+    const handleWheel = (e: WheelEvent) => {
+      // Dashboard表示中またはカレンダー表示中は、タイムラインやカレンダーの横スクロールが必要なため、タブ切り替えスワイプを無効化
+      if (viewMode === 'dashboard' || viewMode === 'calendar' || (window.innerWidth < 1024 && mobileView === 'calendar')) return;
+
+      // 垂直スクロールが支配的な場合は無視
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        accumulatedX.current = 0;
+        return;
+      }
+
+      // 横スクロール検知
+      if (Math.abs(e.deltaX) > 2) {
+        // ブラウザの「戻る/進む」ジェスチャーを防止（可能な場合）
+        if (Math.abs(e.deltaX) > 10 && e.cancelable) {
+          e.preventDefault();
+        }
+
+        // ロック中の処理
+        if (swipeLocked.current) {
+          // 逆方向に強く回された場合はロックを解除して即座に反応できるようにする
+          if ((accumulatedX.current > 0 && e.deltaX < -10) || (accumulatedX.current < 0 && e.deltaX > 10)) {
+            swipeLocked.current = false;
+            accumulatedX.current = 0;
+          } else {
+            return;
+          }
+        }
+
+        accumulatedX.current += e.deltaX;
+
+        // PCでの閾値を調整 (15-20程度でより軽く)
+        const threshold = 18;
+        if (Math.abs(accumulatedX.current) > threshold) {
+          handleSwipe(accumulatedX.current > 0 ? 'left' : 'right');
+          
+          // ロック開始
+          swipeLocked.current = true;
+          
+          // タイマーによる強制ロック解除 (慣性が止まらない場合への備え)
+          if (lockTimer.current) clearTimeout(lockTimer.current);
+          lockTimer.current = setTimeout(() => {
+            swipeLocked.current = false;
+            accumulatedX.current = 0;
+          }, 350); // 0.35秒後に自動解放
+        }
+      } else {
+        // 微小な動きになったら蓄積をリセットし、ロックを解除
+        if (Math.abs(e.deltaX) < 1.5) {
+          accumulatedX.current = 0;
+          swipeLocked.current = false;
+        }
+      }
+    };
+
+    const handleTouchStart = (e: TouchEvent) => {
+      touchStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    };
+
+    const handleTouchEnd = (e: TouchEvent) => {
+      if (viewMode === 'dashboard' || viewMode === 'calendar') return;
+      const touchEndX = e.changedTouches[0].clientX;
+      const touchEndY = e.changedTouches[0].clientY;
+      const diffX = touchEndX - touchStart.current.x;
+      const diffY = Math.abs(touchEndY - touchStart.current.y);
+      
+      if (Math.abs(diffX) > 40 && Math.abs(diffX) > diffY * 1.5) {
+        handleSwipe(diffX > 0 ? 'right' : 'left');
+      }
+    };
+
+    window.addEventListener('wheel', handleWheel, { passive: false });
+    window.addEventListener('touchstart', handleTouchStart, { passive: true });
+    window.addEventListener('touchend', handleTouchEnd, { passive: true });
+    
+    return () => {
+      window.removeEventListener('wheel', handleWheel);
+      window.removeEventListener('touchstart', handleTouchStart);
+      window.removeEventListener('touchend', handleTouchEnd);
+      if (lockTimer.current) clearTimeout(lockTimer.current);
+    };
+  }, [viewMode, mobileView]);
+  
+  // Undo/Redo state
+  const [history, setHistory] = useState<{tasks: Task[], settings: any}[]>([]);
+  const [redoStack, setRedoStack] = useState<{tasks: Task[], settings: any}[]>([]);
+  const [isUndoing, setIsUndoing] = useState(false);
+
+  const [isNewTaskMemoExpanded, setIsNewTaskMemoExpanded] = useState(false);
+  const [isMemoModalOpen, setIsMemoModalOpen] = useState(false);
+  const [lastBackupTime, setLastBackupTime] = useState<number>(() => {
+    return Number(localStorage.getItem('trifocus_last_backup')) || 0;
+  });
+  const [archiveFilter, setArchiveFilter] = useState<'all' | '1m' | '3m' | '6m' | '1y'>('all');
+  const [trashFilter, setTrashFilter] = useState<'all' | '1w' | '2w'>('all');
+
+  const [dirHandle, setDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
+  const [dirPermission, setDirPermission] = useState<'granted' | 'prompt' | 'denied'>('prompt');
+  const [isIdbLoaded, setIsIdbLoaded] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [lastSyncTime, setLastSyncTime] = useState<number | null>(() => {
+    const saved = Number(localStorage.getItem('trifocus_last_backup'));
+    return saved > 0 ? saved : null;
+  });
+  const [backupSlots, setBackupSlots] = useState<Record<1 | 2 | 3, LocalBackupSlotInfo | null>>(() => {
+    try {
+      const saved = localStorage.getItem('navfor_local_backup_slots');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return {
+          1: parsed[1]?.writtenToDisk ? parsed[1] : null,
+          2: parsed[2]?.writtenToDisk ? parsed[2] : null,
+          3: parsed[3]?.writtenToDisk ? parsed[3] : null,
+        };
+      }
+    } catch {}
+    return { 1: null, 2: null, 3: null };
+  });
+  const backupSlotsRef = useRef<Record<1 | 2 | 3, LocalBackupSlotInfo | null>>(backupSlots);
+  backupSlotsRef.current = backupSlots;
+  const [nextBackupSlot, setNextBackupSlot] = useState<1 | 2 | 3>(() => {
+    return resolveDailyBackupSlot(backupSlots, Date.now());
+  });
+  const nextBackupSlotRef = useRef<1 | 2 | 3>(nextBackupSlot);
+  const lastWrittenSignatureRef = useRef<string>((() => {
+    let latest: LocalBackupSlotInfo | null = null;
+    for (const s of [1, 2, 3] as const) {
+      const info = backupSlots[s];
+      if (info && info.timestamp > (latest?.timestamp || 0)) {
+        latest = info;
+      }
+    }
+    return latest?.signature || '';
+  })());
+  const lastWrittenDateRef = useRef<string>((() => {
+    let latest: LocalBackupSlotInfo | null = null;
+    for (const s of [1, 2, 3] as const) {
+      const info = backupSlots[s];
+      if (info && info.timestamp > (latest?.timestamp || 0)) {
+        latest = info;
+      }
+    }
+    return latest ? format(new Date(latest.timestamp), 'yyyy-MM-dd') : '';
+  })());
+  const isWritingLocalRef = useRef<boolean>(false);
+  const pendingSyncAfterWriteRef = useRef<boolean>(false);
+  const tasksLoadedRef = useRef<boolean>(false);
+  const backupChannelRef = useRef<BroadcastChannel | null>(null);
+  const dirHandleRef = useRef<FileSystemDirectoryHandle | null>(dirHandle);
+  const dirPermissionRef = useRef<'granted' | 'prompt' | 'denied'>(dirPermission);
+  const tasksRef = useRef<Task[]>(tasks);
+  const folderMetasRef = useRef<Record<string, FolderMeta>>(folderMetas);
+  const userRef = useRef<User | null>(user);
+  dirHandleRef.current = dirHandle;
+  dirPermissionRef.current = dirPermission;
+  tasksRef.current = tasks;
+  folderMetasRef.current = folderMetas;
+  userRef.current = user;
+  const localLogSettingsRef = useRef<HTMLDivElement>(null);
+  const [highlightLocalSettings, setHighlightLocalSettings] = useState(false);
+  const [showCleanupMenu, setShowCleanupMenu] = useState(false);
+  const [showSectionMenu, setShowSectionMenu] = useState(false);
+  const [showSyncDetails, setShowSyncDetails] = useState(false);
+  const [showTrashMenu, setShowTrashMenu] = useState(false);
+  const [showProjectFilter, setShowProjectFilter] = useState(false);
+
+  // Restore saved FileSystemDirectoryHandle from IndexedDB on startup, focus, and cross-tab events
+  const refreshDirHandleFromIDB = async () => {
+    try {
+      const handle = await loadDirHandleFromIDB();
+      if (!handle) {
+        setIsIdbLoaded(true);
+        return null;
+      }
+      let activeHandle = dirHandleRef.current;
+      let isSame = false;
+      if (activeHandle && typeof (activeHandle as any).isSameEntry === 'function') {
+        try {
+          isSame = await (activeHandle as any).isSameEntry(handle);
+        } catch {}
+      }
+      if (!isSame) {
+        setDirHandle(handle);
+        dirHandleRef.current = handle;
+        activeHandle = handle;
+      }
+      try {
+        if (typeof (activeHandle as any).queryPermission === 'function') {
+          const perm = await (activeHandle as any).queryPermission({ mode: 'readwrite' });
+          setDirPermission(perm);
+          dirPermissionRef.current = perm;
+        } else {
+          setDirPermission('granted');
+          dirPermissionRef.current = 'granted';
+        }
+      } catch {
+        setDirPermission('prompt');
+        dirPermissionRef.current = 'prompt';
+      }
+      setIsIdbLoaded(true);
+      return activeHandle;
+    } catch {
+      setIsIdbLoaded(true);
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    refreshDirHandleFromIDB();
+
+    const handleFocusOrVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        refreshDirHandleFromIDB().then((h) => {
+          if (h && dirPermissionRef.current === 'granted' && !isWritingLocalRef.current && userRef.current) {
+            verifyDiskBackupSlots(h);
+          }
+        });
+        const todaySlot = resolveDailyBackupSlot(backupSlotsRef.current, Date.now());
+        nextBackupSlotRef.current = todaySlot;
+        setNextBackupSlot(todaySlot);
+      }
+    };
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key === 'navfor_local_backup_slots' && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue);
+          const nextSlots: Record<1 | 2 | 3, LocalBackupSlotInfo | null> = {
+            1: parsed[1]?.writtenToDisk ? parsed[1] : null,
+            2: parsed[2]?.writtenToDisk ? parsed[2] : null,
+            3: parsed[3]?.writtenToDisk ? parsed[3] : null,
+          };
+          backupSlotsRef.current = nextSlots;
+          setBackupSlots(nextSlots);
+          const todaySlot = resolveDailyBackupSlot(nextSlots, Date.now());
+          nextBackupSlotRef.current = todaySlot;
+          setNextBackupSlot(todaySlot);
+        } catch {}
+      } else if ((e.key === 'navfor_local_backup_next_slot' || e.key === 'navfor_local_backup_active_slot') && e.newValue) {
+        const todaySlot = resolveDailyBackupSlot(backupSlotsRef.current, Date.now());
+        nextBackupSlotRef.current = todaySlot;
+        setNextBackupSlot(todaySlot);
+      } else if (e.key === 'trifocus_last_backup' && e.newValue) {
+        const ts = Number(e.newValue);
+        if (ts > 0) setLastSyncTime(ts);
+      }
+    };
+
+    window.addEventListener('focus', handleFocusOrVisibility);
+    document.addEventListener('visibilitychange', handleFocusOrVisibility);
+    window.addEventListener('storage', handleStorage);
+
+    let channel: BroadcastChannel | null = null;
+    if (typeof BroadcastChannel !== 'undefined') {
+      try {
+        channel = new BroadcastChannel('navfor_local_backup_channel');
+        backupChannelRef.current = channel;
+        channel.onmessage = async (ev) => {
+          const msg = ev.data;
+          if (!msg) return;
+          if (msg.type === 'DIR_HANDLE_UPDATED' && msg.handle) {
+            const receivedHandle = msg.handle as FileSystemDirectoryHandle;
+            setDirHandle(receivedHandle);
+            dirHandleRef.current = receivedHandle;
+            try {
+              const perm = typeof (receivedHandle as any).queryPermission === 'function'
+                ? await (receivedHandle as any).queryPermission({ mode: 'readwrite' })
+                : 'granted';
+              setDirPermission(perm);
+              dirPermissionRef.current = perm;
+            } catch {
+              setDirPermission('granted');
+              dirPermissionRef.current = 'granted';
+            }
+          } else if (msg.type === 'BACKUP_SLOTS_UPDATED') {
+            if (msg.slots) {
+              backupSlotsRef.current = msg.slots;
+              setBackupSlots(msg.slots);
+            }
+            if (msg.nextSlot) {
+              nextBackupSlotRef.current = msg.nextSlot;
+              setNextBackupSlot(msg.nextSlot);
+            }
+            if (msg.lastSyncTime) setLastSyncTime(msg.lastSyncTime);
+            if (msg.signature) lastWrittenSignatureRef.current = msg.signature;
+            if (msg.activeDate) lastWrittenDateRef.current = msg.activeDate;
+          }
+        };
+      } catch {}
+    }
+
+    return () => {
+      window.removeEventListener('focus', handleFocusOrVisibility);
+      document.removeEventListener('visibilitychange', handleFocusOrVisibility);
+      window.removeEventListener('storage', handleStorage);
+      if (channel) {
+        try { channel.close(); } catch {}
+      }
+    };
+  }, []);
+
+  // Synchronously request write permission during an active user gesture if handle is in 'prompt' state
+  const requestDirPermissionIfNeeded = () => {
+    const handle = dirHandleRef.current;
+    if (!handle || dirPermissionRef.current === 'granted') return;
+    try {
+      if (typeof (handle as any).requestPermission === 'function') {
+        (handle as any).requestPermission({ mode: 'readwrite' }).then((perm: 'granted' | 'prompt' | 'denied') => {
+          dirPermissionRef.current = perm;
+          setDirPermission(perm);
+        }).catch(() => {});
+      }
+    } catch {}
+  };
+
+  // Automatically re-verify write permission on user interaction if handle was restored from IndexedDB with 'prompt'
+  useEffect(() => {
+    if (!dirHandle || dirPermission === 'granted') return;
+
+    let requesting = false;
+    const handleUserGesture = () => {
+      if (requesting || dirPermissionRef.current === 'granted') return;
+      const currentHandle = dirHandleRef.current;
+      if (!currentHandle) return;
+      requesting = true;
+      try {
+        if (typeof (currentHandle as any).requestPermission === 'function') {
+          // Must be invoked synchronously inside the click/keydown handler to preserve transient user activation
+          (currentHandle as any).requestPermission({ mode: 'readwrite' })
+            .then((perm: 'granted' | 'prompt' | 'denied') => {
+              dirPermissionRef.current = perm;
+              setDirPermission(perm);
+            })
+            .catch(() => {})
+            .finally(() => {
+              requesting = false;
+            });
+        } else {
+          dirPermissionRef.current = 'granted';
+          setDirPermission('granted');
+          requesting = false;
+        }
+      } catch {
+        requesting = false;
+      }
+    };
+
+    window.addEventListener('click', handleUserGesture, { capture: true });
+    window.addEventListener('keydown', handleUserGesture, { capture: true });
+    return () => {
+      window.removeEventListener('click', handleUserGesture, { capture: true } as any);
+      window.removeEventListener('keydown', handleUserGesture, { capture: true } as any);
+    };
+  }, [dirHandle, dirPermission]);
+
+  useEffect(() => {
+    if (message && message.type !== 'error') {
+      const timer = setTimeout(() => {
+        setMessage(null);
+      }, 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [message]);
+
+  const [settings, setSettings] = useState({
+    urgentLimit: 3,
+    deadlineThreshold: 3,
+    archiveThresholdDays: 90,
+    doneToTrashThresholdDays: 7,
+    trashCleanupThresholdDays: 30,
+    archiveDoneToTrashDays: 7,
+    archiveInactiveToTrashDays: 99999,
+    criticalThreshold: 100,
+    isLocalBackupEnabled: false,
+    localBackupPath: '',
+    displayMode: 'standard' as 'compact' | 'standard' | 'large',
+    displayModeFocus: 'standard' as 'compact' | 'standard' | 'large',
+    displayModeTodo: 'standard' as 'compact' | 'standard' | 'large',
+    language: 'en' as 'en' | 'ja' | 'fr',
+    sections: []
+  });
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const standaloneReadmeHtmlUrl = useStandaloneReadmeHtmlUrl(settings.language);
+
+  function L(jaText: string, enText: string, frText: string): string {
+    return tr(settings.language, jaText, enText, frText);
+  }
+
+  const t = (key: string, data?: Record<string, string | number>) => {
+    const translations: Record<string, Record<string, string>> = {
+      en: {
+        'Default': 'Default',
+        'Done': 'Done',
+        'TotalLabel': 'Total',
+        'Urgent': 'Focus',
+        'Focus': 'ToDo',
+        'Archive': 'Archive',
+        'Trash': 'Trash Bin',
+        'Settings': 'Settings',
+        'Dashboard': 'Dashboard',
+        'Calendar': 'Calendar',
+        'Entry': 'Entry',
+        'Language': 'Language',
+        'English': 'English',
+        'Japanese': 'Japanese',
+        'French': 'French',
+        'StandardView': 'Standard View',
+        'LargeView': 'Grand View',
+        'CompactView': 'List View',
+        'InactiveMoveToTrash': 'Inactive items archived after',
+        'PermanentDeleteAfter': 'Items will be deleted after',
+        'EmptyTrash': 'Empty Trash',
+        'Reset': 'Reset',
+        'FilterProjects': 'Filter Projects',
+        'Days': 'days',
+        'MovingSoon': 'Moving to Trash Soon',
+        'DeletingSoon': 'Deleting Soon',
+        'ArchiveEmpty': 'Archive Empty',
+        'TrashEmpty': 'Trash Bin is Empty',
+        'NoUrgent': 'No Focus Tasks',
+        'NoFocus': 'No ToDo Tasks',
+        'Expired': 'Expired Deadlines',
+        'Approaching': 'Approaching Deadlines',
+        'Pinned': 'Pinned',
+        'PinnedGlobal': 'Pinned (Global)',
+        'ExpiredGlobal': 'Expired Deadlines (Global)',
+        'ApproachingGlobal': 'Approaching Deadlines (Global)',
+        'Extract': 'Extract',
+        'SystemArchive': 'System Archive',
+        'TaskEntry': 'New Task Entry',
+        'WorkflowHealth': 'Working Status',
+        'Status': 'Working Status',
+        'DoneToday': 'Done Today',
+        'Authenticated': 'Authenticated',
+        'DataLifecycle': 'Data Lifecycle',
+        'ExportData': 'Export Data',
+        'ImportData': 'Import Data',
+        'DownloadCSV': 'Download CSV',
+        'ImportCSV': 'Import CSV',
+        'AccountInformation': 'Account Information',
+        'CloudSynced': 'Cloud Synced',
+        'LocalOnly': 'Local Only',
+        'UrgentCapacity': 'Focus Capacity',
+        'HealthMetrics': 'ToDo Limit Settings',
+        'CriticalThreshold': 'Critical Threshold',
+        'DeadlineThreshold': 'Deadline Threshold',
+        'DoneTrashLifecycle': 'Done & Trash Lifecycle',
+        'GlobalLoad': 'Global Load',
+        'CriticalLoad': 'Critical Load',
+        'WarningHighLoad': 'Warning High Load',
+        'SafeCapacity': 'Safe Capacity',
+        'AutomatedSyncStatus': 'Automated Sync Status',
+        'TaskDetail': 'Task Detail',
+        'PersonalAccount': 'Personal Account',
+        'NotSignedIn': 'Not signed in',
+        'DisconnectAccount': 'Disconnect account',
+        'Items': 'Items',
+        'SystemState': 'System State',
+        'Search': 'Search',
+        'All': 'All',
+        'AllItems': 'All Items',
+        'Older1m': '1 Month Ago',
+        'Older3m': '3 Months Ago',
+        'Older6m': '6 Months Ago',
+        'Older1y': '1 Year Ago',
+        'TimeFilter': 'Time Filter',
+        'UrgentSlotLimit': 'Focus Slot Limit',
+        'MaxConcurrentUrgent': 'Maximum concurrent priority tasks allowed.',
+        'CriticalAlertDesc': 'Maximum ToDo tasks before critical alert. Warning is at 70%.',
+        'DeadlineThresholdDesc': 'Days before deadline to prioritize task in ToDo list.',
+        'DoneToTrash': 'Done to Trash',
+        'DoneToTrashDesc': 'How long to keep completed tasks in ToDo before Trashing.',
+        'TrashAutoCleanup': 'Trash Auto-Cleanup',
+        'TrashAutoCleanupDesc': 'Permanently delete items in Trash after this period.',
+        'AutoArchiveSweep': 'Auto Archive Sweep',
+        'ArchiveThreshold': 'Archive Threshold',
+        'ArchiveThresholdDesc': 'Move items to archive after specified inactivity period.',
+        'ArchiveDoneToTrash': 'Auto-trash completed archive items',
+        'ArchiveDoneToTrashDesc': 'Move completed tasks in archive to trash after specified period.',
+        'ArchiveInactiveToTrash': 'Auto-trash inactive archive items',
+        'ArchiveInactiveToTrashDesc': 'Move inactive tasks in archive to trash after specified period.',
+        'MovingToTrashSoon': 'Moving soon to Trash',
+        'SyncToCloud': 'Sync to Cloud',
+        'SyncToCloudDesc': 'Sign in to sync across all devices in real-time.',
+        'ContinueWithGoogle': 'Continue with Google',
+        'ResetSettingsDesc': 'Reset all app settings to default.',
+        'PermissionNeeded': 'Permission needed to continue saving after refresh.',
+        'Syncing': 'Syncing...',
+        'BackupNeeded': 'Backup Needed',
+        'BackedUp': 'Backed Up',
+        'LastSuccessfulLog': 'Last Successful Log',
+        'SelectLanguageDesc': 'Select your preferred interface language.',
+        'ProjectFilter': 'Project Filter',
+        'SyncActive': 'Sync Active',
+        'SyncOff': 'Sync Off',
+        'Today': 'Today',
+        'WeekOf': 'Week of',
+        'year': 'Year',
+        'month': 'Month',
+        'week': 'Week',
+        'day': 'Day',
+        'AddToFocus': 'Add ToDo',
+        'SyncAndBackup': 'Sync & Backup',
+        'LocalFolderLog': 'Local Folder Log',
+        'LocalDirectoryPath': 'Local Directory Path',
+        'NoFolderSelected': 'No Folder Selected',
+        'AuthorizeSession': 'Authorize Session',
+        'SelectFolder': 'Select Folder',
+        'ManualLocalBackup': 'Manual Local Backup',
+        'SaveBackupToLocal': 'Save Backup to Local',
+        'DangerZone': 'Danger Zone',
+        'ForceResetSettings': 'Force Reset Settings',
+        'CommittingChanges': 'Committing Changes...',
+        'AuthorizedLocalFolder': 'Authorized Local Folder',
+        'RenameWorkspace': 'Rename Workspace?',
+        'ForceBackupNow': 'Force Backup Now',
+        'Star': 'Important',
+        'Maximize': 'Maximize',
+        'SystemActions': 'System Actions',
+        'MoveToUrgent': 'Move to Focus',
+        'RestoreToFocus': 'Move to ToDo',
+        'ArchiveTask': 'Archive Task',
+        'MoveToTrash': 'Move to Trash',
+        'DeletePermanently': 'Delete Permanently',
+        'General': 'General',
+        'WorkspaceLabel': 'workspace',
+        'Metadata': 'Metadata',
+        'Cancel': 'Cancel',
+        'CommitChanges': 'Commit Changes',
+        'DeleteConfirm': 'Delete this task permanently?',
+        'ProjectCode': 'Project Code',
+        'SafeCapacityUppercase': 'SAFE CAPACITY',
+        'GeneralProjectOverview': 'General Project Overview',
+        'ProjectOverview': 'Project Overview',
+        'NoTasks': 'No tasks found.',
+        'SyncOffUppercase': 'SYNC OFF',
+        'DailyChoice': 'Daily Choice',
+        'ExtractDesc': 'Select up to {n} priority tasks from ToDo to move to Focus.',
+        'ExtractLimitAlert': 'You can only add {n} more task(s) to Focus.',
+        'NoFocusTasks': 'No tasks in ToDo list.',
+        'SetDailyFocus': "Set Today's Focus",
+        'Slots': 'slots',
+        'ContextSubtasks': 'Context Subtasks',
+        'UrlPlaceholder': 'URL Placeholder',
+        'DetailsPlaceholder': 'Task detail... (Cmd/Ctrl+Enter to save)',
+        'ExampleProjects': 'e.g. CORE, DEV',
+        'BroadViewMemoPlaceholder': 'Deep dive into context, sub-tasks, or brainstorm ideas here...',
+        'Clear': 'Clear',
+        'Pin': 'Pin',
+        'TaskDescription': 'Task Description',
+        'LastUpdatedLabel': 'Last updated',
+        'StatusNever': 'Never',
+        'MarkDone': 'Mark as Done',
+        'MarkUndone': 'Mark as ToDo',
+      },
+      ja: {
+        'Default': 'デフォルト',
+        'TotalLabel': '計',
+        'Urgent': 'フォーカス',
+        'Focus': 'ToDo',
+        'Archive': 'アーカイブ',
+        'Trash': 'ゴミ箱',
+        'Settings': '設定',
+        'Dashboard': 'ダッシュボード',
+        'Calendar': 'カレンダー',
+        'Entry': '入力',
+        'Language': '言語設定',
+        'English': '英語 (English)',
+        'Japanese': '日本語 (Japanese)',
+        'French': 'フランス語 (Français)',
+        'StandardView': 'グリッド (標準)',
+        'LargeView': 'グリッド (大きく表示)',
+        'CompactView': 'リスト表示',
+        'Done': '完了',
+        'Pending': '未完了',
+        'Filters': 'フィルター',
+        'Reset': 'リセット',
+        'NoTasks': 'タスクがありません',
+        'NoProjectsTracked': 'まだプロジェクトが管理されていません。',
+        'InactiveMoveToTrash': '非アクティブなアイテムは自動的にアーカイブされます - 期間:',
+        'PermanentDeleteAfter': 'ゴミ箱のアイテムは自動的に消去されます - 期間:',
+        'EmptyTrash': 'ゴミ箱を空にする',
+        'FilterProjects': 'プロジェクトでフィルタ',
+        'Days': '日',
+        'MovingSoon': 'まもなくゴミ箱へ移動',
+        'DeletingSoon': 'まもなく完全に消去',
+        'ArchiveEmpty': 'アーカイブは空です',
+        'TrashEmpty': 'ゴミ箱は空です',
+        'NoUrgent': 'フォーカスはありません',
+        'NoFocus': 'ToDoはありません',
+        'Expired': '期限切れ',
+        'Approaching': 'まもなく期限',
+        'Pinned': 'ピン留め',
+        'PinnedGlobal': 'ピン留め (全体)',
+        'ExpiredGlobal': '期限切れ (全体)',
+        'ApproachingGlobal': 'まもなく期限 (全体)',
+        'Extract': '抽出',
+        'SystemArchive': 'アーカイブ',
+        'TaskEntry': 'タスクの追加',
+        'WorkflowHealth': 'ワークステータス',
+        'Status': 'ワークステータス',
+        'DoneToday': '本日の完了',
+        'Authenticated': 'ログイン中',
+        'DataLifecycle': 'データ管理',
+        'ExportData': 'データのエクスポート',
+        'ImportData': 'データのインポート',
+        'DownloadCSV': 'CSVをダウンロード',
+        'ImportCSV': 'CSVをインポート',
+        'AccountInformation': 'アカウント情報',
+        'CloudSynced': 'クラウド同期中',
+        'LocalOnly': 'ローカル保存のみ',
+        'UrgentCapacity': 'フォーカス容量',
+        'HealthMetrics': 'ToDo上限設定',
+        'CriticalThreshold': '限界しきい値',
+        'DeadlineThreshold': '締切しきい値',
+        'DoneTrashLifecycle': '完了したタスクの処理',
+        'PersonalAccount': '共有なし',
+        'NotSignedIn': 'ログインしていません',
+        'DisconnectAccount': 'アカウントの連携解除',
+        'Items': '件',
+        'SystemState': 'System State',
+        'Search': '検索',
+        'All': 'すべて',
+        'AllItems': 'すべてのアイテム',
+        'Older1m': '1ヶ月以上前',
+        'Older3m': '3ヶ月以上前',
+        'Older6m': '6ヶ月以上前',
+        'Older1y': '1年以上前',
+        'TimeFilter': '時間フィルター',
+        'UrgentSlotLimit': 'フォーカス枠の上限',
+        'MaxConcurrentUrgent': '同時に進められる優先タスクの最大数です。',
+        'CriticalAlertDesc': 'ToDoタスクの許容量。70%で警告、100%で限界。',
+        'DeadlineThresholdDesc': '締切の何日前からToDoリストで優先するか設定します。',
+        'DoneToTrash': '完了からゴミ箱へ',
+        'DoneToTrashDesc': '完了したタスクをゴミ箱に送るまでの日数。',
+        'TrashAutoCleanup': 'ゴミ箱の自動整理',
+        'TrashAutoCleanupDesc': 'ゴミ箱に入ったアイテムを完全に削除するまでの日数。',
+        'MoveToUrgent': 'フォーカスへ移動',
+        'RestoreToFocus': 'ToDoへ戻す',
+        'ArchiveTask': 'アーカイブする',
+        'MoveToTrash': 'ゴミ箱へ移動',
+        'DeletePermanently': '完全に削除',
+        'General': '一般',
+        'WorkspaceLabel': 'ワークスペース',
+        'SelectLanguageDesc': 'インターフェースの表示言語を設定します。',
+        'GlobalLoad': '全体の負荷',
+        'CriticalLoad': 'CRITICAL LOAD',
+        'WarningHighLoad': 'HIGH LOAD',
+        'SafeCapacity': 'SAFE CAPACITY',
+        'GeneralProjectOverview': 'プロジェクト概況',
+        'ProjectOverview': 'のプロジェクト概況',
+        'Total': '件',
+        'Slots': '最大枠',
+        'SyncToCloud': 'クラウド同期',
+        'SyncToCloudDesc': 'ログインすると、全てのデバイスでタスクをリアルタイムに同期できます。',
+        'ContinueWithGoogle': 'Googleでログイン',
+        'ProjectCode': 'プロジェクト名',
+        'TaskDetail': 'タスク内容',
+        'ContextSubtasks': '背景やサブタスクなど... (Ctrl+Enterで保存)',
+        'DetailsPlaceholder': '詳細を入力... (Ctrl+Enterで保存)',
+        'ExampleProjects': '例: CORE, DEV',
+        'Memos': 'メモ',
+        'Expand': '広げる',
+        'Shrink': '閉じる',
+        'Urls': 'リンク',
+        'Add': '追加',
+        'UrlPlaceholder': 'https://... (Ctrl+Enterで保存)',
+        'BroadViewMemoPlaceholder': '詳細なコンテキスト、サブタスク、アイデアのメモなど...',
+        'AddToFocus': 'ToDoに追加',
+        'TaskDescription': 'タスク内容',
+        'Clear': 'クリア',
+        'Pin': 'ピン留め',
+        'SignIn': 'ログイン',
+        'LogOut': 'ログアウト',
+        'Deadline': '締切',
+        'Never': '自動削除なし (手動のみ)',
+        'NeverCleanup': '自動整理なし',
+        'AutoArchiveSweep': 'アーカイブの自動整理',
+        'ArchiveThreshold': 'アーカイブへの移動',
+        'ArchiveThresholdDesc': '最後に操作してからアーカイブに移動するまでの期間を設定します。',
+        'ArchiveDoneToTrash': 'アーカイブ内完了タスクのごみ箱移動',
+        'ArchiveDoneToTrashDesc': 'アーカイブ内で完了(Done)にしたタスクを自動でゴミ箱へ移動する期間を設定します。',
+        'ArchiveInactiveToTrash': 'アーカイブ内非アクティブタスクのごみ箱移動',
+        'ArchiveInactiveToTrashDesc': 'アーカイブ内の未完了かつ非アクティブなタスクを自動でゴミ箱へ移動する期間を設定します。',
+        'MovingToTrashSoon': 'もうすぐゴミ箱へ移動',
+        'SyncAndBackup': '同期とバックアップ',
+        'LocalFolderLog': 'ローカル保存ログ',
+        'LocalFolderLogDesc': 'PCへの自動CSVバックアップを有効にします。',
+        'LocalDirectoryPath': '保存先フォルダ',
+        'NoFolderSelected': 'フォルダが選択されていません',
+        'AuthorizeSession': '許可のリクエスト',
+        'SelectFolder': 'フォルダを選択',
+        'ManualLocalBackup': '手動でバックアップ',
+        'SaveBackupToLocal': 'ローカルに保存',
+        'LastSaved': '最終保存',
+        'DailyUpdateRecommendation': '推奨: 1日1回の更新',
+        'DangerZone': '危険な操作',
+        'ResetSettingsDesc': 'CRITICAL: Cloud上の全タスクを削除します。この操作は取り消せません。同期が有効な場合、まず緊急バックアップが作成されます。',
+        'ForceResetSettings': 'クラウドタスクを完全に消去',
+        'PermissionNeeded': 'ブラウザの更新後、保存を再開するには許可が必要です。',
+        'ProjectFilter': 'プロジェクト',
+        'FilterByProject': 'プロジェクトで絞り込み',
+        'Syncing': '同期中...',
+        'SyncActive': '同期有効',
+        'BackupNeeded': '要バックアップ',
+        'Today': '今日',
+        'WeekOf': '週:',
+        'BackedUp': 'バックアップ済み',
+        'SyncOff': '同期オフ',
+        'SyncOffUppercase': '同期オフ',
+        'year': '年',
+        'month': '月',
+        'week': '週',
+        'day': '日',
+        'AutomatedSyncStatus': '自動同期ステータス',
+        'LastSuccessfulLog': '最終ログ保存',
+        'CommittingChanges': '保存中...',
+        'AuthorizedLocalFolder': '認証済みフォルダ',
+        'RenameWorkspace': 'ワークスペース名を変更しますか？',
+        'ForceBackupNow': '今すぐバックアップ',
+        'Star': '重要',
+        'Maximize': '最大化',
+        'SystemActions': '操作',
+        'Metadata': 'メタデータ',
+        'Cancel': 'キャンセル',
+        'CommitChanges': '変更を保存',
+        'DeleteConfirm': 'このタスクを完全に削除しますか？',
+        'DailyChoice': '本日の抽出',
+        'ExtractDesc': 'ToDoから最大 {n} 件の優先タスクを選択して、フォーカスに移動します。',
+        'ExtractLimitAlert': 'フォーカスにはあと {n} 件しか追加できません。',
+        'NoFocusTasks': 'ToDoリストにタスクがありません。',
+        'SetDailyFocus': '本日のフォーカスを設定',
+        'LastUpdatedLabel': '最終更新',
+        'StatusNever': '未更新',
+        'MarkDone': '完了にする',
+        'MarkUndone': '未完了に戻す',
+      },
+      fr: {
+        'Default': 'Par défaut',
+        'TotalLabel': 'Total',
+        'Urgent': 'Focus',
+        'Focus': 'ToDo',
+        'Archive': 'Archives',
+        'Trash': 'Corbeille',
+        'Settings': 'Paramètres',
+        'Dashboard': 'Tableau de bord',
+        'Calendar': 'Calendrier',
+        'Entry': 'Saisie',
+        'Language': 'Langue',
+        'English': 'Anglais (English)',
+        'Japanese': 'Japonais (Japanese)',
+        'French': 'Français (French)',
+        'StandardView': 'Vue Standard',
+        'LargeView': 'Grande Vue',
+        'CompactView': 'Vue Liste',
+        'Done': 'Terminé',
+        'Pending': 'En attente',
+        'Filters': 'Filtres',
+        'Reset': 'Réinitialiser',
+        'NoTasks': 'Aucune tâche trouvée',
+        'NoProjectsTracked': 'Aucun projet suivi pour le moment.',
+        'InactiveMoveToTrash': 'Articles inactifs archivés après',
+        'PermanentDeleteAfter': 'Les articles seront supprimés après',
+        'EmptyTrash': 'Vider la corbeille',
+        'FilterProjects': 'Filtrer par projet',
+        'Days': 'jours',
+        'MovingSoon': 'Bientôt dans la corbeille',
+        'DeletingSoon': 'Suppression imminente',
+        'ArchiveEmpty': 'Archives vides',
+        'TrashEmpty': 'La corbeille est vide',
+        'NoUrgent': 'Aucune tâche prioritaire',
+        'NoFocus': 'Aucune tâche ToDo',
+        'Expired': 'Échéances dépassées',
+        'Approaching': 'Échéances proches',
+        'Pinned': 'Épinglés',
+        'PinnedGlobal': 'Épinglés (Global)',
+        'ExpiredGlobal': 'Échéances dépassées (Global)',
+        'ApproachingGlobal': 'Échéances proches (Global)',
+        'Extract': 'Extraire',
+        'SystemArchive': 'Archives Système',
+        'TaskEntry': 'Nouvelle tâche',
+        'WorkflowHealth': 'État de travail',
+        'Status': 'Statut',
+        'DoneToday': 'Terminé aujourd\'hui',
+        'Authenticated': 'Authentifié',
+        'DataLifecycle': 'Cycle de vie des données',
+        'ExportData': 'Exporter les données',
+        'ImportData': 'Importer les données',
+        'DownloadCSV': 'Télécharger CSV',
+        'ImportCSV': 'Importer CSV',
+        'AccountInformation': 'Informations du compte',
+        'CloudSynced': 'Synchronisé avec le Cloud',
+        'LocalOnly': 'Local uniquement',
+        'UrgentCapacity': 'Capacité Focus',
+        'HealthMetrics': 'Paramètres ToDo',
+        'CriticalThreshold': 'Seuil critique',
+        'DeadlineThreshold': 'Seuil d\'échéance',
+        'DoneTrashLifecycle': 'Cycle de vie Terminé & Corbeille',
+        'PersonalAccount': 'Compte personnel',
+        'NotSignedIn': 'Non connecté',
+        'DisconnectAccount': 'Déconnecter le compte',
+        'Items': 'Articles',
+        'SystemState': 'État du système',
+        'Search': 'Recherche',
+        'All': 'Tout',
+        'AllItems': 'Tous les éléments',
+        'Older1m': 'Plus de 1 mois',
+        'Older3m': 'Plus de 3 mois',
+        'Older6m': 'Plus de 6 mois',
+        'Older1y': 'Plus de 1 an',
+        'TimeFilter': 'Filtre de temps',
+        'UrgentSlotLimit': 'Limite de slots Focus',
+        'MaxConcurrentUrgent': 'Nombre maximum de tâches prioritaires autorisées.',
+        'CriticalAlertDesc': 'Nombre maximum de tâches ToDo avant alerte critique. Alerte à 70%.',
+        'DeadlineThresholdDesc': 'Jours avant l\'échéance pour prioriser la tâche.',
+        'DoneToTrash': 'Terminé vers Corbeille',
+        'DoneToTrashDesc': 'Temps de conservation des tâches terminées.',
+        'TrashAutoCleanup': 'Nettoyage automatique Corbeille',
+        'TrashAutoCleanupDesc': 'Suppression définitive après cette période.',
+        'MoveToUrgent': 'Déplacer vers Focus',
+        'RestoreToFocus': 'Remettre dans ToDo',
+        'ArchiveTask': 'Archiver la tâche',
+        'MoveToTrash': 'Mettre à la corbeille',
+        'DeletePermanently': 'Supprimer définitivement',
+        'General': 'Général',
+        'WorkspaceLabel': 'workspace',
+        'SelectLanguageDesc': 'Choisissez votre langue d\'interface.',
+        'GlobalLoad': 'Charge globale',
+        'CriticalLoad': 'CHARGE CRITIQUE',
+        'WarningHighLoad': 'CHARGE ÉLEVÉE',
+        'SafeCapacity': 'CAPACITÉ SÛRE',
+        'GeneralProjectOverview': 'Aperçu général du projet',
+        'ProjectOverview': 'Aperçu du projet',
+        'Total': 'Total',
+        'Slots': 'Slots',
+        'SyncToCloud': 'Synchro Cloud',
+        'SyncToCloudDesc': 'Connectez-vous pour synchroniser en temps réel.',
+        'ContinueWithGoogle': 'Continuer avec Google',
+        'ProjectCode': 'Code projet',
+        'TaskDetail': 'Détails de la tâche',
+        'ContextSubtasks': 'Contexte, sous-tâches... (Cmd/Ctrl+Entrée pour enregistrer)',
+        'DetailsPlaceholder': 'Détails... (Cmd/Ctrl+Entrée pour enregistrer)',
+        'ExampleProjects': 'Ex: CORE, DEV',
+        'Memos': 'Mémos',
+        'Expand': 'Agrandir',
+        'Shrink': 'Réduire',
+        'Urls': 'Liens',
+        'Add': 'Ajouter',
+        'UrlPlaceholder': 'https://... (Cmd/Ctrl+Entrée pour enregistrer)',
+        'BroadViewMemoPlaceholder': 'Approfondissez le contexte, les sous-tâches ou les idées ici...',
+        'Clear': 'Effacer',
+        'Pin': 'Épingler',
+        'TaskDescription': 'Description de la tâche',
+        'AddToFocus': 'Ajouter à ToDo',
+        'SignIn': 'Connexion',
+        'LogOut': 'Déconnexion',
+        'Deadline': 'Date limite',
+        'Never': 'Jamais',
+        'NeverCleanup': 'Pas de nettoyage',
+        'AutoArchiveSweep': 'Balayage automatique Archive',
+        'ArchiveThreshold': 'Seuil d\'archivage',
+        'ArchiveThresholdDesc': 'Déplacer vers les archives après inactivité.',
+        'ArchiveDoneToTrash': 'Mise à la corbeille auto (terminées)',
+        'ArchiveDoneToTrashDesc': 'Déplacer les tâches terminées de l\'archive vers la corbeille après la période spécifiée.',
+        'ArchiveInactiveToTrash': 'Mise à la corbeille auto (inactives)',
+        'ArchiveInactiveToTrashDesc': 'Déplacer les tâches inactives de l\'archive vers la corbeille après la période spécifiée.',
+        'MovingToTrashSoon': 'Bientôt à la corbeille',
+        'SyncAndBackup': 'Synchro & Sauvegarde',
+        'LocalFolderLog': 'Log dossier local',
+        'LocalFolderLogDesc': 'Active la sauvegarde CSV automatique.',
+        'LocalDirectoryPath': 'Chemin dossier local',
+        'NoFolderSelected': 'Aucun dossier sélectionné',
+        'AuthorizeSession': 'Autoriser la session',
+        'SelectFolder': 'Choisir dossier',
+        'ManualLocalBackup': 'Sauvegarde locale manuelle',
+        'SaveBackupToLocal': 'Enregistrer la sauvegarde',
+        'LastSaved': 'Dernière sauvegarde',
+        'DailyUpdateRecommendation': 'Recommandé : 1 mise à jour par jour',
+        'DangerZone': 'Zone de danger',
+        'ResetSettingsDesc': 'CRITICAL: Supprime TOUTES les tâches du cloud.',
+        'ForceResetSettings': 'Effacer les données cloud',
+        'PermissionNeeded': 'Autorisation requise pour continuer.',
+        'ProjectFilter': 'Filtre projet',
+        'FilterByProject': 'Filtrer par projet',
+        'Syncing': 'Synchronisation...',
+        'SyncActive': 'Synchro Active',
+        'BackupNeeded': 'Sauvegarde requise',
+        'Today': "Aujourd'hui",
+        'WeekOf': 'Semaine du',
+        'BackedUp': 'Sauvegardé',
+        'SyncOff': 'Synchro Off',
+        'SyncOffUppercase': 'SYNCHRO OFF',
+        'year': 'Année',
+        'month': 'Mois',
+        'week': 'Semaine',
+        'day': 'Jour',
+        'AutomatedSyncStatus': 'Statut Synchro Auto',
+        'LastSuccessfulLog': 'Dernier log réussi',
+        'CommittingChanges': 'Enregistrement...',
+        'AuthorizedLocalFolder': 'Dossier local autorisé',
+        'RenameWorkspace': 'Renommer l\'espace de travail ?',
+        'ForceBackupNow': 'Forcer sauvegarde',
+        'Star': 'Important',
+        'Maximize': 'Agrandir',
+        'SystemActions': 'Actions système',
+        'Metadata': 'Métadonnées',
+        'Cancel': 'Annuler',
+        'CommitChanges': 'Enregistrer',
+        'DeleteConfirm': 'Supprimer définitivement ?',
+        'DailyChoice': 'Choix quotidien',
+        'ExtractDesc': 'Sélectionnez jusqu\'à {n} tâches prioritaires de ToDo pour les déplacer vers Focus.',
+        'ExtractLimitAlert': 'Vous ne pouvez ajouter que {n} tâche(s) supplémentaire(s) à Focus.',
+        'NoFocusTasks': 'Aucune tâche dans la liste ToDo.',
+        'SetDailyFocus': 'Fixer le Focus du jour',
+        'LastUpdatedLabel': 'Dernière mise à jour',
+        'StatusNever': 'Jamais',
+        'MarkDone': 'Marquer comme terminé',
+        'MarkUndone': 'Remettre en attente',
+      }
+    };
+    const lang = settings.language || 'en';
+    let text = translations[lang]?.[key] || key;
+    if (data) {
+      Object.entries(data).forEach(([k, v]) => {
+        text = text.replace(`{${k}}`, String(v));
+      });
+    }
+    return text;
+  };
+
+  const handleFirestoreError = (err: unknown, operationType: OperationType, path: string | null) => {
+    const errInfo = {
+      error: err instanceof Error ? err.message : String(err),
+      authInfo: {
+        userId: auth.currentUser?.uid,
+        email: auth.currentUser?.email,
+        emailVerified: auth.currentUser?.emailVerified,
+        isAnonymous: auth.currentUser?.isAnonymous,
+        tenantId: auth.currentUser?.tenantId,
+        providerInfo: auth.currentUser?.providerData?.map(provider => ({
+          providerId: provider.providerId,
+          email: provider.email,
+        })) || []
+      },
+      operationType,
+      path
+    };
+    console.error('Firestore Error: ', JSON.stringify(errInfo));
+    
+    if (errInfo.error.includes('permissions') || errInfo.error.includes('permission')) {
+      setMessage({ 
+        text: `Permission Denied: Ensure you are logged in and rules are deployed. Details: ${errInfo.error}`, 
+        type: 'error' 
+      });
+    } else {
+      setMessage({ text: `Database Error: ${errInfo.error}`, type: 'error' });
+    }
+    
+    throw new Error(JSON.stringify(errInfo));
+  };
+
+  const isLocalLogConfigured = Boolean(settings.isLocalBackupEnabled && settings.localBackupPath);
+  const isLocalDiskReady = Boolean(isLocalLogConfigured && dirHandle && dirPermission === 'granted');
+
+  const jumpToLocalLogSettings = () => {
+    setShowSyncDetails(false);
+    setViewMode('settings');
+    setMobileView('settings');
+    setHighlightLocalSettings(true);
+    setTimeout(() => {
+      localLogSettingsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 250);
+    setTimeout(() => {
+      setHighlightLocalSettings(false);
+    }, 3200);
+  };
+
+  // Auth State
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Settings Sync
+  useEffect(() => {
+    if (!user) return;
+
+    const settingsRef = doc(db, 'settings', user.uid);
+    const unsubscribe = onSnapshot(settingsRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        const loadedSections = (data.sections && data.sections.length > 0) ? data.sections : ['General'];
+        let resolvedArchiveThresholdDays = data.archiveThresholdDays !== undefined ? data.archiveThresholdDays : 90;
+        try {
+          if (!localStorage.getItem('navfor_migrated_archive_threshold_90_v1')) {
+            localStorage.setItem('navfor_migrated_archive_threshold_90_v1', '1');
+            if (resolvedArchiveThresholdDays === 99999) {
+              resolvedArchiveThresholdDays = 90;
+              setDoc(settingsRef, { archiveThresholdDays: 90 }, { merge: true }).catch(() => {});
+            }
+          }
+        } catch {}
+        setSettings({
+          urgentLimit: data.urgentLimit || 3,
+          deadlineThreshold: data.deadlineThreshold || 3,
+          archiveThresholdDays: resolvedArchiveThresholdDays,
+          doneToTrashThresholdDays: data.doneToTrashThresholdDays || 7,
+          trashCleanupThresholdDays: data.trashCleanupThresholdDays || 30,
+          archiveDoneToTrashDays: data.archiveDoneToTrashDays !== undefined ? data.archiveDoneToTrashDays : 7,
+          archiveInactiveToTrashDays: data.archiveInactiveToTrashDays !== undefined ? data.archiveInactiveToTrashDays : 99999,
+          criticalThreshold: data.criticalThreshold || 100,
+          isLocalBackupEnabled: data.isLocalBackupEnabled || false,
+          localBackupPath: data.localBackupPath || '',
+          displayMode: data.displayMode === 'card' ? 'standard' : (data.displayMode === 'list' ? 'compact' : (data.displayMode || 'standard')),
+          displayModeFocus: data.displayModeFocus || 'standard',
+          displayModeTodo: data.displayModeTodo || 'standard',
+          language: data.language || 'en',
+          sections: loadedSections
+        });
+
+        if (data.localBackupSlots && typeof data.localBackupSlots === 'object') {
+          const remoteSlots = data.localBackupSlots;
+          const mergedSlots: Record<1 | 2 | 3, LocalBackupSlotInfo | null> = {
+            ...backupSlotsRef.current,
+          };
+          let slotsChanged = false;
+          let newestTs = 0;
+          for (const s of [1, 2, 3] as const) {
+            const rSlot = remoteSlots[s] || remoteSlots[String(s)];
+            const lSlot = mergedSlots[s];
+            if (rSlot && rSlot.writtenToDisk && typeof rSlot.timestamp === 'number' && rSlot.timestamp > 0) {
+              if (!lSlot || rSlot.timestamp > lSlot.timestamp || lSlot.taskCount !== rSlot.taskCount) {
+                mergedSlots[s] = {
+                  slot: s,
+                  fileName: rSlot.fileName || `NavFOR_Log_${user.email?.split('@')[0] || 'local'}_${s}.csv`,
+                  timestamp: rSlot.timestamp,
+                  taskCount: typeof rSlot.taskCount === 'number' ? rSlot.taskCount : 0,
+                  signature: rSlot.signature || lSlot?.signature,
+                  writtenToDisk: true,
+                };
+                slotsChanged = true;
+              }
+            }
+            if (mergedSlots[s] && mergedSlots[s]!.timestamp > newestTs) {
+              newestTs = mergedSlots[s]!.timestamp;
+            }
+          }
+          if (slotsChanged) {
+            backupSlotsRef.current = mergedSlots;
+            setBackupSlots(mergedSlots);
+            const resolved = resolveDailyBackupSlot(mergedSlots, Date.now());
+            nextBackupSlotRef.current = resolved;
+            setNextBackupSlot(resolved);
+            try {
+              localStorage.setItem('navfor_local_backup_slots', JSON.stringify(mergedSlots));
+            } catch {}
+          }
+          if (newestTs > 0) {
+            setLastSyncTime(prev => (!prev || newestTs > prev ? newestTs : prev));
+            setLastBackupTime(prev => (!prev || newestTs > prev ? newestTs : prev));
+          }
+        }
+        if (typeof data.lastLocalSyncTime === 'number' && data.lastLocalSyncTime > 0) {
+          setLastSyncTime(prev => (!prev || data.lastLocalSyncTime > prev ? data.lastLocalSyncTime : prev));
+          setLastBackupTime(prev => (!prev || data.lastLocalSyncTime > prev ? data.lastLocalSyncTime : prev));
+        }
+        
+        // Ensure activeSection is valid
+        setActiveSection(prev => {
+          if (!prev || !loadedSections.includes(prev)) {
+            return loadedSections[0];
+          }
+          return prev;
+        });
+      } else {
+        // Init default settings for new user
+        setDoc(settingsRef, {
+          userId: user.uid,
+          urgentLimit: 3,
+          deadlineThreshold: 3,
+          archiveThresholdDays: 90,
+          doneToTrashThresholdDays: 7,
+          trashCleanupThresholdDays: 30,
+          archiveDoneToTrashDays: 7,
+          archiveInactiveToTrashDays: 99999,
+          criticalThreshold: 100,
+          isLocalBackupEnabled: false,
+          localBackupPath: '',
+          displayMode: 'standard',
+          displayModeFocus: 'standard',
+          displayModeTodo: 'standard',
+          language: 'en',
+          sections: ['General']
+        }).catch(err => handleFirestoreError(err, OperationType.WRITE, `settings/${user.uid}`));
+      }
+    }, (err) => handleFirestoreError(err, OperationType.GET, `settings/${user.uid}`));
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // Tasks & Folders Sync
+  useEffect(() => {
+    if (!user) {
+      // When not signed in, ensure folders and tasks are completely empty
+      setTasks([]);
+      setFolderMetas({});
+      return;
+    }
+
+    const tasksQuery = query(collection(db, 'tasks'), where('userId', '==', user.uid));
+    const unsubscribeTasks = onSnapshot(tasksQuery, (snapshot) => {
+      const taskList: Task[] = [];
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        if (data.userId === user.uid) {
+          taskList.push({ id: doc.id, ...data } as Task);
+        }
+      });
+      tasksLoadedRef.current = true;
+      tasksRef.current = taskList;
+      setTasks(taskList);
+    }, (err) => {
+      console.warn("Tasks listener notice:", err.message);
+    });
+
+    const foldersQuery = query(collection(db, 'folders'), where('userId', '==', user.uid));
+    const unsubscribeFolders = onSnapshot(foldersQuery, (snapshot) => {
+      const metasMap: Record<string, FolderMeta> = {};
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        if (data.userId === user.uid) {
+          const p = data.path || doc.id;
+          metasMap[p] = {
+            path: p,
+            section: data.section || 'General',
+            ...data
+          } as FolderMeta;
+        }
+      });
+      folderMetasRef.current = metasMap;
+      setFolderMetas(metasMap);
+    }, (err) => {
+      console.warn("Folders listener notice:", err.message);
+    });
+
+    return () => {
+      unsubscribeTasks();
+      unsubscribeFolders();
+    };
+  }, [user, settings.archiveThresholdDays]);
+
+  // Migration Helper
+  useEffect(() => {
+    if (!user || authLoading) return;
+
+    const migrate = async () => {
+      const savedTasks = localStorage.getItem('navfor_local_tasks') || localStorage.getItem('focusflow_tasks');
+      const savedSettings = localStorage.getItem('navfor_local_settings') || localStorage.getItem('focusflow_settings');
+
+      if (savedTasks || savedSettings) {
+        const hasData = await getDocs(query(collection(db, 'tasks'), where('userId', '==', user.uid)));
+        if (hasData.empty) {
+          if (savedSettings) {
+            try {
+              const parsed = JSON.parse(savedSettings);
+              await setDoc(doc(db, 'settings', user.uid), {
+                userId: user.uid,
+                ...parsed
+              }).catch(e => console.error("Migration settings error", e));
+            } catch (e) {
+              console.error("Settings parse error", e);
+            }
+          }
+
+          if (savedTasks) {
+            try {
+              const parsed = JSON.parse(savedTasks);
+              if (Array.isArray(parsed) && parsed.length > 0) {
+                const batch = writeBatch(db);
+                parsed.forEach((t: any) => {
+                  const newRef = doc(collection(db, 'tasks'));
+                  batch.set(newRef, {
+                    ...t,
+                    userId: user.uid,
+                    createdAt: Number(t.createdAt) || Date.now(),
+                    updatedAt: Number(t.updatedAt) || Date.now(),
+                  });
+                });
+                await batch.commit().catch(e => console.error("Migration tasks error", e));
+              }
+            } catch (e) {
+              console.error("Tasks parse error", e);
+            }
+          }
+          
+          // Clear local storage after migration
+          localStorage.removeItem('navfor_local_tasks');
+          localStorage.removeItem('navfor_local_settings');
+          localStorage.removeItem('focusflow_tasks');
+          localStorage.removeItem('focusflow_settings');
+          localStorage.removeItem('navfor_mode');
+          setMessage({ text: L("ローカルデータをクラウドに同期しました。", "Synced local data to the cloud.", "Données locales synchronisées avec le cloud."), type: 'info' });
+        }
+      }
+    };
+
+    migrate();
+  }, [user, authLoading]);
+
+  // Local state persistence helper
+  const syncLocalTasks = (newTasks: Task[]) => {
+    setTasks(newTasks);
+    try {
+      localStorage.setItem('navfor_local_tasks', JSON.stringify(newTasks));
+    } catch (e) {
+      console.error('Failed to save to local storage', e);
+    }
+  };
+
+  const syncLocalFolderMetas = (newMetas: Record<string, FolderMeta>) => {
+    setFolderMetas(newMetas);
+    try {
+      localStorage.setItem('navfor_folder_metas', JSON.stringify(newMetas));
+    } catch (e) {
+      console.error('Failed to save folder metas to local storage', e);
+    }
+  };
+
+  // Save Settings wrapper
+  const saveSettings = async (updates: Partial<typeof settings>) => {
+    setSettings(prev => {
+      const next = { ...prev, ...updates };
+
+      // If sync is disabled, clear the directory handle inside the update logic
+      if ('isLocalBackupEnabled' in updates && !updates.isLocalBackupEnabled) {
+        setDirHandle(null);
+        clearDirHandleFromIDB();
+      }
+
+      if (user) {
+        // Trigger Firestore update with the most current state
+        setDoc(doc(db, 'settings', user.uid), {
+          userId: user.uid,
+          ...next
+        }, { merge: true }).catch(err => handleFirestoreError(err, OperationType.WRITE, `settings/${user.uid}`));
+      } else {
+        try {
+          localStorage.setItem('navfor_local_settings', JSON.stringify(next));
+        } catch (e) {
+          console.error("Local settings write error", e);
+        }
+      }
+      return next;
+    });
+  };
+
+  const isListMode = settings.displayMode === 'compact';
+
+  const projects = useMemo(() => {
+    const sectionTasks = tasks.filter(t => t.section === activeSection || (!t.section && activeSection === settings.sections[0]));
+    const p = Array.from(new Set(sectionTasks.map(t => t.project)));
+    return ['All', ...p];
+  }, [tasks, activeSection, settings.sections]);
+
+  const stats = useMemo(() => {
+    // Current workspace filter
+    const isInActiveSection = (t: Task) => t.section === activeSection || (!t.section && activeSection === settings.sections[0]);
+    
+    // Global metrics (Urgent + Focus) - include all for threshold comparison but count active for load
+    const priorityTasks = tasks.filter(t => (t.category === 'Focus' || t.category === 'Urgent'));
+    const combinedCount = priorityTasks.filter(t => !t.isDone).length;
+    
+    const urgentCount = tasks.filter(t => t.category === 'Urgent' && !t.isDone).length;
+    const activeTasksCount = tasks.filter(t => (t.category === 'Focus' || t.category === 'Urgent') && !t.isDone).length;
+    
+    // Per-section metrics (Urgent, Focus, Archive and Total in section)
+    const sectionMetrics = settings.sections.reduce((acc, sec, idx) => {
+      const sectionTasks = tasks.filter(t => (t.section === sec || (!t.section && idx === 0)));
+      acc[sec] = {
+        urgent: sectionTasks.filter(t => t.category === 'Urgent' && !t.isDone).length,
+        focus: sectionTasks.filter(t => t.category === 'Focus' && !t.isDone).length,
+        archive: sectionTasks.filter(t => t.category === 'Archive' && !t.isDone).length,
+        total: sectionTasks.length
+      };
+      return acc;
+    }, {} as Record<string, { urgent: number, focus: number, archive: number, total: number }>);
+    
+    const warningThreshold = Math.floor(settings.criticalThreshold * 0.7);
+    let gaugeColor = 'bg-indigo-400';
+    let textColor = 'text-white';
+    
+    if (combinedCount >= settings.criticalThreshold) {
+      gaugeColor = 'bg-red-600';
+      textColor = 'text-red-500 font-black';
+    } else if (combinedCount >= warningThreshold) {
+      gaugeColor = 'bg-orange-400';
+      textColor = 'text-orange-400 font-black';
+    }
+
+    const now = Date.now();
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    
+    // Done today (Urgent + Focus)
+    const doneTodayCount = tasks.filter(t => 
+      t.isDone && 
+      (t.category === 'Urgent' || t.category === 'Focus') && 
+      t.updatedAt >= todayStart.getTime()
+    ).length;
+    
+    let expiredCount = 0;
+    let approachingCount = 0;
+    
+    priorityTasks.forEach(t => {
+      if (t.deadline && !t.isDone) {
+        if (t.deadline < now) {
+          expiredCount++;
+        } else if (t.deadline - now <= settings.deadlineThreshold * 86400000) {
+          approachingCount++;
+        }
+      }
+    });
+
+    const loadPercentage = Math.round(Math.min((combinedCount / settings.criticalThreshold) * 100, 100));
+
+    // Project distribution (filtered by active workspace)
+    const projectStats: Record<string, { 
+      urgent: { todo: number, done: number }, 
+      focus: { todo: number, done: number }, 
+      archive: { todo: number, done: number }, 
+      trash: { todo: number, done: number },
+      total: number,
+      lastUpdated: number
+    }> = {};
+
+    tasks.filter(t => isInActiveSection(t)).forEach(t => {
+      if (!projectStats[t.project]) {
+        projectStats[t.project] = { 
+          urgent: { todo: 0, done: 0 }, 
+          focus: { todo: 0, done: 0 }, 
+          archive: { todo: 0, done: 0 }, 
+          trash: { todo: 0, done: 0 },
+          total: 0,
+          lastUpdated: 0
+        };
+      }
+      
+      const s = projectStats[t.project];
+      s.total++;
+      if ((t.updatedAt || 0) > s.lastUpdated) s.lastUpdated = t.updatedAt || 0;
+
+      if (t.category === 'Urgent') {
+        if (t.isDone) s.urgent.done++; else s.urgent.todo++;
+      } else if (t.category === 'Focus') {
+        if (t.isDone) s.focus.done++; else s.focus.todo++;
+      } else if (t.category === 'Archive') {
+        if (t.isDone) s.archive.done++; else s.archive.todo++;
+      } else if (t.category === 'Trash') {
+        if (t.isDone) s.trash.done++; else s.trash.todo++;
+      }
+    });
+
+    return {
+      active: activeTasksCount,
+      doneToday: doneTodayCount,
+      pendingDeadlines: approachingCount,
+      expiredDeadlines: expiredCount,
+      urgentCount,
+      focusTasksCount: combinedCount,
+      gaugeColor,
+      textColor,
+      warningThreshold,
+      sectionMetrics,
+      morningRoutineReady: urgentCount >= settings.urgentLimit,
+      loadPercentage,
+      projectStats
+    };
+  }, [tasks, settings, activeSection]);
+
+  const pushToHistory = () => {
+    if (isUndoing) return;
+    // Deep clone tasks and settings, but wrap in try-catch to ensure consistency
+    try {
+      const tasksSnapshot = JSON.parse(JSON.stringify(tasks));
+      const settingsSnapshot = JSON.parse(JSON.stringify(settings));
+      setHistory(prev => [{ tasks: tasksSnapshot, settings: settingsSnapshot }, ...prev].slice(0, 50));
+      setRedoStack([]);
+    } catch (e) {
+      console.warn("History push failed", e);
+    }
+  };
+
+  const undo = async () => {
+    if (history.length === 0 || !user || isUndoing) return;
+    setIsUndoing(true);
+    
+    try {
+      const prevState = history[0];
+      const newHistory = history.slice(1);
+      
+      const currentTasksSnapshot = JSON.parse(JSON.stringify(tasks));
+      const currentSettingsSnapshot = JSON.parse(JSON.stringify(settings));
+      setRedoStack(prev => [{ tasks: currentTasksSnapshot, settings: currentSettingsSnapshot }, ...prev]);
+      
+      // Handle large batches by splitting
+      const chunk = <T,>(arr: T[], size: number) => {
+        const chunks = [];
+        for (let i = 0; i < arr.length; i += size) {
+          chunks.push(arr.slice(i, i + size));
+        }
+        return chunks;
+      };
+
+      // 1. Delete tasks that exist now but not in previous state
+      const prevIds = new Set(prevState.tasks.map((t: any) => t.id));
+      const tasksToDelete = tasks.filter(t => !prevIds.has(t.id));
+      const deleteChunks = chunk(tasksToDelete, 400);
+      for (const c of deleteChunks) {
+        const b = writeBatch(db);
+        c.forEach(t => b.delete(doc(db, 'tasks', t.id)));
+        await b.commit();
+      }
+      
+      // 2. Restore previous state tasks
+      const restoreChunks = chunk(prevState.tasks, 400);
+      for (const c of restoreChunks) {
+        const b = writeBatch(db);
+        c.forEach((t: any) => {
+          const { id, ...data } = t;
+          b.set(doc(db, 'tasks', id), data);
+        });
+        await b.commit();
+      }
+      
+      // 3. Restore settings
+      await setDoc(doc(db, 'settings', user.uid), {
+        userId: user.uid,
+        ...prevState.settings
+      });
+      
+      setHistory(newHistory);
+    } catch (err) {
+      console.error("Undo failed details:", err);
+      setMessage({ text: `Undo failed: ${err instanceof Error ? err.message : 'Unknown error'}`, type: 'error' });
+    } finally {
+      setTimeout(() => setIsUndoing(false), 500);
+    }
+  };
+
+  const redo = async () => {
+    if (redoStack.length === 0 || !user || isUndoing) return;
+    setIsUndoing(true);
+    
+    try {
+      const nextState = redoStack[0];
+      const newRedoStack = redoStack.slice(1);
+      
+      const currentTasksSnapshot = JSON.parse(JSON.stringify(tasks));
+      const currentSettingsSnapshot = JSON.parse(JSON.stringify(settings));
+      setHistory(prev => [{ tasks: currentTasksSnapshot, settings: currentSettingsSnapshot }, ...prev]);
+      
+      const chunk = <T,>(arr: T[], size: number) => {
+        const chunks = [];
+        for (let i = 0; i < arr.length; i += size) {
+          chunks.push(arr.slice(i, i + size));
+        }
+        return chunks;
+      };
+
+      const nextIds = new Set(nextState.tasks.map((t: any) => t.id));
+      const tasksToDelete = tasks.filter(t => !nextIds.has(t.id));
+      const deleteChunks = chunk(tasksToDelete, 400);
+      for (const c of deleteChunks) {
+        const b = writeBatch(db);
+        c.forEach(t => b.delete(doc(db, 'tasks', t.id)));
+        await b.commit();
+      }
+      
+      const restoreChunks = chunk(nextState.tasks, 400);
+      for (const c of restoreChunks) {
+        const b = writeBatch(db);
+        c.forEach((t: any) => {
+          const { id, ...data } = t;
+          b.set(doc(db, 'tasks', id), data);
+        });
+        await b.commit();
+      }
+      
+      await setDoc(doc(db, 'settings', user.uid), {
+        userId: user.uid,
+        ...nextState.settings
+      });
+      
+      setRedoStack(newRedoStack);
+    } catch (err) {
+      console.error("Redo failed details:", err);
+      setMessage({ text: 'Redo failed', type: 'error' });
+    } finally {
+      setTimeout(() => setIsUndoing(false), 500);
+    }
+  };
+
+  const dateLocale = useMemo(() => {
+    if (settings.language === 'ja') return ja;
+    if (settings.language === 'fr') return fr;
+    return enUS;
+  }, [settings.language]);
+
+  const searchAndProjectFilteredTasks = useMemo(() => {
+    return tasks.filter(t => {
+      const matchesSearch = t.title.toLowerCase().includes(searchTerm.toLowerCase()) || 
+                           t.project.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                           (t.notes || '').toLowerCase().includes(searchTerm.toLowerCase());
+      const matchesProject = selectedProject === 'All' ? true : (t.project === selectedProject);
+      return matchesSearch && matchesProject;
+    });
+  }, [tasks, searchTerm, selectedProject]);
+
+  const filteredTasks = useMemo(() => {
+    return tasks
+      .filter(t => {
+        const matchesSearch = t.title.toLowerCase().includes(searchTerm.toLowerCase()) || 
+                             t.project.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                             (t.notes || '').toLowerCase().includes(searchTerm.toLowerCase());
+        
+        // Pinned tasks should respect project filter if one is active
+        const matchesProject = selectedProject === 'All' ? true : (t.project === selectedProject);
+        
+        const matchesSection = t.section === activeSection || (!t.section && activeSection === settings.sections[0]);
+        return matchesSearch && matchesProject && matchesSection;
+      })
+      .sort((a, b) => {
+        // Universal Priority 1: Done state (lowest priority)
+        if (a.isDone !== b.isDone) return a.isDone ? 1 : -1;
+
+        // If both are done, sort UNCONDITIONALLY by recency
+        if (a.isDone && b.isDone) {
+          return (b.updatedAt || 0) - (a.updatedAt || 0);
+        }
+
+        // Universal Priority 2: Starred (starred first)
+        const starA = !!a.isStarred;
+        const starB = !!b.isStarred;
+        if (starA !== starB) return starA ? -1 : 1;
+
+        // Universal Priority 3: Recency (updatedAt descending)
+        return (b.updatedAt || 0) - (a.updatedAt || 0);
+      });
+  }, [tasks, searchTerm, selectedProject, activeSection, settings.sections]);
+
+  const groupedFocusTasks = useMemo(() => {
+    const focusTasks = filteredTasks.filter(t => t.category === 'Focus');
+    const threshold = (settings.deadlineThreshold || 3) * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+
+    // Separate expired tasks (top priority)
+    const expired = focusTasks
+      .filter(t => t.deadline && (t.deadline - now) < 0 && !t.isDone);
+
+    // Separate near deadline tasks (excluding expired ones) and sort by date
+    const nearDeadline = focusTasks
+      .filter(t => t.deadline && (t.deadline - now) <= threshold && (t.deadline - now) >= 0 && !t.isDone);
+    
+    // Separate pinned tasks (excluding those already in expired or near deadline)
+    const pinned = focusTasks
+      .filter(t => t.isPinned && !t.isDone && 
+                   !(t.deadline && (t.deadline - now) < 0) &&
+                   !(t.deadline && (t.deadline - now) <= threshold && (t.deadline - now) >= 0));
+      
+    // Others includes those without deadlines, far deadlines, non-pinned, or done tasks
+    const others = focusTasks.filter(t => {
+       const isExpired = t.deadline && (t.deadline - now) < 0 && !t.isDone;
+       const isNear = t.deadline && (t.deadline - now) <= threshold && (t.deadline - now) >= 0 && !t.isDone;
+       const isPinnedNotHandled = t.isPinned && !t.isDone && !isExpired && !isNear;
+       return !isExpired && !isNear && !isPinnedNotHandled;
+    });
+
+    const grouped: Record<string, Task[]> = {};
+    others.forEach(t => {
+      if (!grouped[t.project]) grouped[t.project] = [];
+      grouped[t.project].push(t);
+    });
+    return { expired, nearDeadline, pinned, grouped };
+  }, [filteredTasks, settings.deadlineThreshold]);
+
+  const groupedArchiveTasks = useMemo(() => {
+    const now = Date.now();
+    const oneMonth = 30 * 86400000;
+    const threeMonths = 90 * 86400000;
+    const sixMonths = 180 * 86400000;
+    const oneYear = 365 * 86400000;
+    
+    const archiveTasks = filteredTasks.filter(t => {
+      if (t.category !== 'Archive') return false;
+      const age = now - (t.updatedAt || t.createdAt);
+      if (archiveFilter === '1m') return age >= oneMonth;
+      if (archiveFilter === '3m') return age >= threeMonths;
+      if (archiveFilter === '6m') return age >= sixMonths;
+      if (archiveFilter === '1y') return age >= oneYear;
+      return true;
+    });
+
+    const isNearingTrash = (t: Task) => {
+      const inactiveDays = differenceInDays(now, t.updatedAt || t.createdAt);
+      const isDoneNearing = t.isDone && settings.archiveDoneToTrashDays !== 99999 && (settings.archiveDoneToTrashDays - inactiveDays <= 3);
+      const isInactiveNearing = settings.archiveInactiveToTrashDays !== 99999 && (settings.archiveInactiveToTrashDays - inactiveDays <= 3);
+      return isDoneNearing || isInactiveNearing;
+    };
+
+    // Special category for items nearing auto-move to trash (3 days)
+    const nearingPurge = archiveTasks
+      .filter(isNearingTrash)
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+    const nonNearing = archiveTasks.filter(t => !isNearingTrash(t));
+
+    // Separate pinned tasks
+    const pinned = nonNearing
+      .filter(t => t.isPinned)
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+    const others = nonNearing.filter(t => !t.isPinned);
+
+    const grouped: Record<string, Task[]> = {};
+    others.forEach(t => {
+      if (!grouped[t.project]) grouped[t.project] = [];
+      grouped[t.project].push(t);
+    });
+    return { nearingPurge, pinned, grouped };
+  }, [filteredTasks, settings.archiveDoneToTrashDays, settings.archiveInactiveToTrashDays, archiveFilter]);
+
+  const groupedTrashTasks = useMemo(() => {
+    const now = Date.now();
+    const oneWeek = 7 * 86400000;
+    const twoWeeks = 14 * 86400000;
+
+    const trashTasks = filteredTasks.filter(t => {
+      if (t.category !== 'Trash') return false;
+      const age = now - (t.updatedAt || t.createdAt);
+      if (trashFilter === '1w') return age >= oneWeek;
+      if (trashFilter === '2w') return age >= twoWeeks;
+      return true;
+    });
+
+    // Special category for items nearing auto-purge (3 days)
+    const nearingPurge = trashTasks
+      .filter(t => {
+        if (settings.trashCleanupThresholdDays === 99999) return false;
+        const inactiveDays = differenceInDays(now, t.updatedAt || t.createdAt);
+        return settings.trashCleanupThresholdDays - inactiveDays <= 3;
+      })
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+    const others = trashTasks.filter(t => {
+      if (settings.trashCleanupThresholdDays === 99999) return true;
+      const inactiveDays = differenceInDays(now, t.updatedAt || t.createdAt);
+      return settings.trashCleanupThresholdDays - inactiveDays > 3;
+    });
+
+    const grouped: Record<string, Task[]> = {};
+    others.forEach(t => {
+      if (!grouped[t.project]) grouped[t.project] = [];
+      grouped[t.project].push(t);
+    });
+    return { nearingPurge, grouped };
+  }, [filteredTasks, trashFilter, settings.trashCleanupThresholdDays]);
+
+  const handleAddTask = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newTaskTitle.trim() || !newTaskProject.trim() || !user) return;
+    
+    const newTask: any = {
+      userId: user.uid,
+      title: newTaskTitle.trim(),
+      project: newTaskProject.trim(),
+      notes: newTaskNotes.trim(),
+      urls: newTaskUrls.filter(u => u.trim() !== ''),
+      section: activeSection,
+      category: 'Focus' as Category,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      isDone: false,
+      isStarred: false,
+      isAllDay: isTaskAllDay
+    };
+
+    if (newTaskDeadline) {
+      let deadlineTimestamp = new Date(newTaskDeadline).getTime();
+      if (isTaskAllDay) {
+        const d = new Date(newTaskDeadline);
+        d.setHours(23, 59, 59, 999);
+        deadlineTimestamp = d.getTime();
+      }
+      if (!isNaN(deadlineTimestamp)) {
+        newTask.deadline = deadlineTimestamp;
+      }
+    }
+
+    try {
+      pushToHistory();
+      if (user) {
+        await addDoc(collection(db, 'tasks'), newTask);
+      } else {
+        const localId = 'local_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+        const created: Task = { id: localId, ...newTask };
+        syncLocalTasks([created, ...tasks]);
+      }
+      setNewTaskTitle('');
+      setNewTaskProject('');
+      setNewTaskNotes('');
+      setNewTaskUrls(['']);
+      setNewTaskDeadline('');
+      setIsTaskAllDay(true);
+      setMessage({ text: L("タスクを追加しました。", "Task added.", "Tâche ajoutée."), type: 'info' });
+    } catch (err) {
+      if (user) {
+        handleFirestoreError(err, OperationType.CREATE, 'tasks');
+      } else {
+        console.error("Local add error", err);
+      }
+    }
+  };
+
+  const moveTask = async (id: string, newCategory: Category) => {
+    if (!user) return;
+    if (newCategory === 'Urgent') {
+      const isAlreadyUrgent = tasks.find(t => t.id === id)?.category === 'Urgent';
+      if (!isAlreadyUrgent) {
+        const urgentCount = tasks.filter(t => t.category === 'Urgent').length;
+        if (urgentCount >= settings.urgentLimit) {
+          const errMsg = `Urgent Capacity Full: You have reached the ${settings.urgentLimit} task limit. Complete or archive an existing task first.`;
+          alert(errMsg); // More prominent alert
+          setMessage({ 
+            text: errMsg,
+            type: 'error'
+          });
+          return;
+        }
+      }
+    }
+    pushToHistory();
+    if (user) {
+      try {
+        await updateDoc(doc(db, 'tasks', id), { 
+          category: newCategory, 
+          updatedAt: Date.now() 
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `tasks/${id}`);
+      }
+    } else {
+      syncLocalTasks(tasks.map(t => t.id === id ? { ...t, category: newCategory, updatedAt: Date.now() } : t));
+    }
+  };
+
+  const sanitizeForFirestore = (val: any): any => {
+    if (val === null || val === undefined) return val;
+    if (Array.isArray(val)) {
+      return val.map(sanitizeForFirestore).filter(x => x !== undefined);
+    }
+    if (typeof val === 'object' && !(val instanceof Date) && val.constructor?.name === 'Object') {
+      const cleaned: Record<string, any> = {};
+      for (const [k, v] of Object.entries(val)) {
+        if (v !== undefined) {
+          cleaned[k] = sanitizeForFirestore(v);
+        }
+      }
+      return cleaned;
+    }
+    return val;
+  };
+
+  const updateTask = async (id: string, updates: Partial<Task>) => {
+    if (!user) return;
+
+    if (updates.deadline) {
+      const currentTask = tasks.find(t => t.id === id);
+      const targetProj = updates.project || currentTask?.project;
+      if (targetProj) {
+        const parentLimit = getParentFolderDeadline(targetProj, folderMetas, true);
+        if (parentLimit !== undefined && updates.deadline > parentLimit) {
+          setMessage({
+            text: L(
+              '親フォルダの締切以降は設定できません',
+              "Cannot set deadline after parent folder's deadline",
+              "Impossible de définir une échéance après celle du dossier parent"
+            ),
+            type: 'error'
+          });
+          return;
+        }
+      }
+    }
+
+    pushToHistory();
+    if (user) {
+      try {
+        const firestoreUpdates: Record<string, any> = { updatedAt: Date.now() };
+        for (const [k, v] of Object.entries(updates)) {
+          if (v === undefined) {
+            firestoreUpdates[k] = deleteField();
+          } else {
+            firestoreUpdates[k] = sanitizeForFirestore(v);
+          }
+        }
+        await updateDoc(doc(db, 'tasks', id), firestoreUpdates);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `tasks/${id}`);
+      }
+    } else {
+      syncLocalTasks(tasks.map(t => {
+        if (t.id === id) {
+          const updated = { ...t, ...updates, updatedAt: Date.now() };
+          for (const k of Object.keys(updates)) {
+            if ((updates as any)[k] === undefined) {
+              delete (updated as any)[k];
+            }
+          }
+          return updated;
+        }
+        return t;
+      }));
+    }
+  };
+
+  const toggleDone = async (id: string) => {
+    if (!user) return;
+    const task = tasks.find(t => t.id === id);
+    if (!task) return;
+    pushToHistory();
+    const isBecomingDone = !task.isDone;
+    const updates: any = { 
+      isDone: isBecomingDone, 
+      updatedAt: Date.now() 
+    };
+
+    // Auto-move from Focus (Urgent) to ToDo (Focus) if checked
+    if (isBecomingDone && task.category === 'Urgent') {
+      updates.category = 'Focus';
+    }
+
+    if (user) {
+      try {
+        await updateDoc(doc(db, 'tasks', id), updates);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `tasks/${id}`);
+      }
+    } else {
+      syncLocalTasks(tasks.map(t => t.id === id ? { ...t, ...updates } : t));
+    }
+  };
+
+  const deleteTask = async (id: string) => {
+    if (!user) return;
+    const task = tasks.find(t => t.id === id);
+    if (!task) return;
+
+    pushToHistory();
+    if (task.category === 'Trash') {
+      // If already in trash, perm delete
+      if (user) {
+        try {
+          await deleteDoc(doc(db, 'tasks', id));
+        } catch (err) {
+          handleFirestoreError(err, OperationType.DELETE, `tasks/${id}`);
+        }
+      } else {
+        syncLocalTasks(tasks.filter(t => t.id !== id));
+      }
+    } else {
+      // Move to trash
+      if (user) {
+        try {
+          await updateDoc(doc(db, 'tasks', id), { 
+            category: 'Trash', 
+            updatedAt: Date.now() 
+          });
+        } catch (err) {
+          handleFirestoreError(err, OperationType.UPDATE, `tasks/${id}`);
+        }
+      } else {
+        syncLocalTasks(tasks.map(t => t.id === id ? { ...t, category: 'Trash', updatedAt: Date.now() } : t));
+      }
+    }
+  };
+
+  const toggleStar = async (id: string) => {
+    if (!user) return;
+    const task = tasks.find(t => t.id === id);
+    if (!task) return;
+    pushToHistory();
+    if (user) {
+      try {
+        await updateDoc(doc(db, 'tasks', id), { 
+          isStarred: !task.isStarred, 
+          updatedAt: Date.now() 
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `tasks/${id}`);
+      }
+    } else {
+      syncLocalTasks(tasks.map(t => t.id === id ? { ...t, isStarred: !task.isStarred, updatedAt: Date.now() } : t));
+    }
+  };
+
+  const togglePin = async (id: string) => {
+    if (!user) return;
+    const task = tasks.find(t => t.id === id);
+    if (!task) return;
+    pushToHistory();
+    if (user) {
+      try {
+        await updateDoc(doc(db, 'tasks', id), { 
+          isPinned: !task.isPinned, 
+          updatedAt: Date.now() 
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `tasks/${id}`);
+      }
+    } else {
+      syncLocalTasks(tasks.map(t => t.id === id ? { ...t, isPinned: !task.isPinned, updatedAt: Date.now() } : t));
+    }
+  };
+
+  const addSection = async (name: string) => {
+    if (!user || !name.trim()) return;
+    const trimmedName = name.trim();
+    const next = [...settings.sections, trimmedName];
+    try {
+      await updateDoc(doc(db, 'settings', user.uid), { sections: next });
+      setActiveSection(trimmedName);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `settings/${user.uid}`);
+    }
+  };
+
+  const renameSection = async (oldName: string, newName: string) => {
+    if (!user || !newName.trim()) return;
+    const next = settings.sections.map(s => s === oldName ? newName.trim() : s);
+    try {
+      // 1. Update settings
+      await updateDoc(doc(db, 'settings', user.uid), { sections: next });
+      
+      // 2. Update all tasks in this section
+      const batch = writeBatch(db);
+      const affectedTasks = tasks.filter(t => t.section === oldName);
+      affectedTasks.forEach(t => {
+        batch.update(doc(db, 'tasks', t.id), { section: newName.trim() });
+      });
+      await batch.commit();
+
+      if (activeSection === oldName) setActiveSection(newName.trim());
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `settings/${user.uid}`);
+    }
+  };
+
+  const deleteSection = async (name: string) => {
+    if (!user) return;
+    if (settings.sections.length <= 1) {
+      setMessage({ text: "Cannot delete the last workspace. Please add another one first.", type: 'error' });
+      return;
+    }
+    if (!window.confirm(`Delete workspace "${name}" and ALL tasks within it? This cannot be undone.`)) return;
+
+    const next = settings.sections.filter(s => s !== name);
+    try {
+      // 1. Update settings
+      await updateDoc(doc(db, 'settings', user.uid), { sections: next });
+      
+      // 2. Delete all tasks in this section
+      const batch = writeBatch(db);
+      const affectedTasks = tasks.filter(t => t.section === name);
+      affectedTasks.forEach(t => {
+        batch.delete(doc(db, 'tasks', t.id));
+      });
+      await batch.commit();
+
+      if (activeSection === name) setActiveSection(next[0]);
+      setMessage({ text: `Workspace "${name}" and ${affectedTasks.length} tasks deleted.`, type: 'info' });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `settings/${user.uid}`);
+    }
+  };
+
+  const onSectionDragEnd = async (result: any) => {
+    if (!result.destination || !user) return;
+    const items = Array.from(settings.sections);
+    const [reorderedItem] = items.splice(result.source.index, 1);
+    items.splice(result.destination.index, 0, reorderedItem);
+
+    try {
+      await updateDoc(doc(db, 'settings', user.uid), { sections: items });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `settings/${user.uid}`);
+    }
+  };
+
+  const permanentlyDeleteTask = async (id: string) => {
+    if (!user) return;
+    if (user) {
+      try {
+        await deleteDoc(doc(db, 'tasks', id));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, `tasks/${id}`);
+      }
+    } else {
+      syncLocalTasks(tasks.filter(t => t.id !== id));
+    }
+  };
+
+  const emptyTrash = async () => {
+    if (!user) return;
+    
+    // Respect active filters (Project, Section, and Time Filter)
+    const now = Date.now();
+    const oneWeek = 7 * 86400000;
+    const twoWeeks = 14 * 86400000;
+
+    const trashTasksVisible = filteredTasks.filter(t => {
+      if (t.category !== 'Trash') return false;
+      const age = now - (t.updatedAt || t.createdAt);
+      if (trashFilter === '1w') return age >= oneWeek;
+      if (trashFilter === '2w') return age >= twoWeeks;
+      return true;
+    });
+
+    if (trashTasksVisible.length === 0) {
+      setMessage({ text: "No trash items match current filter criteria.", type: 'info' });
+      return;
+    }
+
+    if (!window.confirm(`Permanently delete ${trashTasksVisible.length} items matching current filters? This cannot be undone.`)) return;
+
+    pushToHistory();
+    if (user) {
+      try {
+        const batch = writeBatch(db);
+        trashTasksVisible.forEach(t => {
+          batch.delete(doc(db, 'tasks', t.id));
+        });
+        await batch.commit();
+        setMessage({ text: `${trashTasksVisible.length} items permanently deleted.`, type: 'info' });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.DELETE, 'batch/empty-trash');
+      }
+    } else {
+      const visibleIds = new Set(trashTasksVisible.map(t => t.id));
+      syncLocalTasks(tasks.filter(t => !visibleIds.has(t.id)));
+      setMessage({ text: L(`${trashTasksVisible.length} 件のアイテムを完全に削除しました。`, `${trashTasksVisible.length} items permanently deleted.`, `${trashTasksVisible.length} éléments supprimés définitivement.`), type: 'info' });
+    }
+  };
+
+  const updateFolderMeta = async (path: string, updates: Partial<FolderMeta>) => {
+    if (!path) return;
+    const current = folderMetas[path] || { path, section: activeSection, category: 'Focus' };
+    const sanitizedLocal: FolderMeta = {
+      ...current,
+      ...updates,
+      path,
+      section: current.section || activeSection,
+      updatedAt: Date.now()
+    };
+    for (const k of Object.keys(updates)) {
+      if ((updates as any)[k] === undefined) {
+        delete (sanitizedLocal as any)[k];
+      }
+    }
+
+    const nextMap = {
+      ...folderMetas,
+      [path]: sanitizedLocal
+    };
+    setFolderMetas(nextMap);
+
+    if (user) {
+      try {
+        const folderDocId = `${user.uid}_${encodeURIComponent(path).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+        const firestoreUpdates: Record<string, any> = {
+          path,
+          section: sanitizedLocal.section || activeSection,
+          userId: user.uid,
+          updatedAt: Date.now()
+        };
+        for (const [k, v] of Object.entries(updates)) {
+          if (v === undefined) {
+            firestoreUpdates[k] = deleteField();
+          } else {
+            firestoreUpdates[k] = sanitizeForFirestore(v);
+          }
+        }
+        await setDoc(doc(db, 'folders', folderDocId), firestoreUpdates, { merge: true });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `folders/${path}`);
+      }
+    } else {
+      syncLocalFolderMetas(nextMap);
+    }
+  };
+
+  const handleToggleFolderStar = (path: string) => {
+    const current = folderMetas[path];
+    updateFolderMeta(path, { isStarred: !current?.isStarred });
+  };
+
+  const handleToggleFolderPin = (path: string) => {
+    const current = folderMetas[path];
+    updateFolderMeta(path, { isPinned: !current?.isPinned });
+  };
+
+  const handleArchiveFolder = async (folderPath: string) => {
+    if (!folderPath) return;
+    pushToHistory();
+
+    const isInsideFolder = (p: string) => p === folderPath || p.startsWith(folderPath + '/');
+    const affectedTasks = tasks.filter(t => isInsideFolder(t.project));
+    const now = Date.now();
+
+    if (user) {
+      try {
+        const batch = writeBatch(db);
+        affectedTasks.forEach(t => {
+          batch.update(doc(db, 'tasks', t.id), { category: 'Archive', updatedAt: now });
+        });
+
+        // Update folder meta and all subfolder metas
+        const currentMetas: Record<string, FolderMeta> = { ...folderMetas };
+        if (!currentMetas[folderPath]) {
+          currentMetas[folderPath] = { path: folderPath, section: activeSection, category: 'Archive' };
+        }
+        (Object.entries(currentMetas) as [string, FolderMeta][]).forEach(([p, meta]) => {
+          if (isInsideFolder(p)) {
+            const folderDocId = `${user.uid}_${encodeURIComponent(p).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+            batch.set(doc(db, 'folders', folderDocId), {
+              ...meta,
+              category: 'Archive',
+              userId: user.uid,
+              updatedAt: now
+            }, { merge: true });
+          }
+        });
+        await batch.commit();
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `folders/${folderPath}`);
+      }
+    } else {
+      syncLocalTasks(tasks.map(t => isInsideFolder(t.project) ? { ...t, category: 'Archive', updatedAt: now } : t));
+      const nextMetas = { ...folderMetas };
+      if (!nextMetas[folderPath]) {
+        nextMetas[folderPath] = { path: folderPath, section: activeSection, category: 'Archive' };
+      }
+      Object.keys(nextMetas).forEach(p => {
+        if (isInsideFolder(p)) {
+          nextMetas[p] = { ...nextMetas[p], category: 'Archive', updatedAt: now };
+        }
+      });
+      syncLocalFolderMetas(nextMetas);
+    }
+
+    setMessage({
+      text: L(
+        `フォルダ「${folderPath}」および内包タスク(${affectedTasks.length}件)をアーカイブしました。`,
+        `Archived folder "${folderPath}" and ${affectedTasks.length} tasks.`,
+        `Dossier « ${folderPath} » et ${affectedTasks.length} tâches archivés.`
+      ),
+      type: 'info'
+    });
+  };
+
+  const handleTrashFolder = async (folderPath: string) => {
+    if (!folderPath) return;
+    pushToHistory();
+
+    const isInsideFolder = (p: string) => p === folderPath || p.startsWith(folderPath + '/');
+    const affectedTasks = tasks.filter(t => isInsideFolder(t.project));
+    const now = Date.now();
+
+    if (user) {
+      try {
+        const batch = writeBatch(db);
+        affectedTasks.forEach(t => {
+          batch.update(doc(db, 'tasks', t.id), { category: 'Trash', updatedAt: now });
+        });
+
+        // Update folder meta and subfolder metas
+        const currentMetas: Record<string, FolderMeta> = { ...folderMetas };
+        if (!currentMetas[folderPath]) {
+          currentMetas[folderPath] = { path: folderPath, section: activeSection, category: 'Trash' };
+        }
+        (Object.entries(currentMetas) as [string, FolderMeta][]).forEach(([p, meta]) => {
+          if (isInsideFolder(p)) {
+            const folderDocId = `${user.uid}_${encodeURIComponent(p).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+            batch.set(doc(db, 'folders', folderDocId), {
+              ...meta,
+              category: 'Trash',
+              userId: user.uid,
+              updatedAt: now
+            }, { merge: true });
+          }
+        });
+        await batch.commit();
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `folders/${folderPath}`);
+      }
+    } else {
+      syncLocalTasks(tasks.map(t => isInsideFolder(t.project) ? { ...t, category: 'Trash', updatedAt: now } : t));
+      const nextMetas = { ...folderMetas };
+      if (!nextMetas[folderPath]) {
+        nextMetas[folderPath] = { path: folderPath, section: activeSection, category: 'Trash' };
+      }
+      Object.keys(nextMetas).forEach(p => {
+        if (isInsideFolder(p)) {
+          nextMetas[p] = { ...nextMetas[p], category: 'Trash', updatedAt: now };
+        }
+      });
+      syncLocalFolderMetas(nextMetas);
+    }
+
+    // Close any tabs related to this folder or tasks inside it
+    const isTabInFolder = (tabId: string) => {
+      if (tabId === `folder:${folderPath}` || tabId.startsWith(`folder:${folderPath}/`)) return true;
+      const t = tasks.find(task => task.id === tabId);
+      return t ? isInsideFolder(t.project) : false;
+    };
+    setOpenTaskIds(prev => prev.filter(id => !isTabInFolder(id)));
+    if (activeTabTaskId && isTabInFolder(activeTabTaskId)) {
+      setActiveTabTaskId(null);
+    }
+
+    // Also clean up any custom empty folders in localStorage
+    try {
+      const storageKey = `navfor_folders_${activeSection}`;
+      const saved = localStorage.getItem(storageKey);
+      if (saved) {
+        const folders: string[] = JSON.parse(saved);
+        const updated = folders.filter(f => f !== folderPath && !f.startsWith(folderPath + '/'));
+        localStorage.setItem(storageKey, JSON.stringify(updated));
+        window.dispatchEvent(new Event('navfor_folders_updated'));
+      }
+    } catch {}
+
+    setMessage({
+      text: L(
+        `フォルダ「${folderPath}」および内包タスク(${affectedTasks.length}件)をゴミ箱へ移動しました。`,
+        `Moved folder "${folderPath}" and ${affectedTasks.length} tasks to trash.`,
+        `Dossier « ${folderPath} » et ${affectedTasks.length} tâches déplacés vers la corbeille.`
+      ),
+      type: 'info'
+    });
+  };
+
+  const handleRenameFolder = async (oldFolderPath: string, newFolderPath: string) => {
+    if (!oldFolderPath || !newFolderPath || oldFolderPath === newFolderPath) return;
+    pushToHistory();
+
+    const affectedTasks = tasks.filter(t => 
+      t.project === oldFolderPath || t.project.startsWith(oldFolderPath + '/')
+    );
+
+    if (user) {
+      try {
+        const batch = writeBatch(db);
+        affectedTasks.forEach(t => {
+          const updatedProject = t.project === oldFolderPath 
+            ? newFolderPath 
+            : newFolderPath + t.project.slice(oldFolderPath.length);
+          batch.update(doc(db, 'tasks', t.id), { project: updatedProject, updatedAt: Date.now() });
+        });
+        await batch.commit();
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `folders/${oldFolderPath}`);
+      }
+    } else {
+      syncLocalTasks(tasks.map(t => {
+        if (t.project === oldFolderPath) {
+          return { ...t, project: newFolderPath, updatedAt: Date.now() };
+        }
+        if (t.project.startsWith(oldFolderPath + '/')) {
+          return { ...t, project: newFolderPath + t.project.slice(oldFolderPath.length), updatedAt: Date.now() };
+        }
+        return t;
+      }));
+    }
+
+    // Update folderMetas map
+    const nextMetas = { ...folderMetas };
+    let metasChanged = false;
+    Object.keys(nextMetas).forEach(k => {
+      if (k === oldFolderPath || k.startsWith(oldFolderPath + '/')) {
+        const newKey = k === oldFolderPath ? newFolderPath : newFolderPath + k.slice(oldFolderPath.length);
+        nextMetas[newKey] = { ...nextMetas[k], path: newKey, updatedAt: Date.now() };
+        delete nextMetas[k];
+        metasChanged = true;
+      }
+    });
+    if (metasChanged) {
+      if (user) {
+        // Also update / migrate folder docs in Firestore
+        try {
+          const batch = writeBatch(db);
+          (Object.entries(nextMetas) as [string, FolderMeta][]).forEach(([p, meta]) => {
+            if (p === newFolderPath || p.startsWith(newFolderPath + '/')) {
+              const folderDocId = `${user.uid}_${encodeURIComponent(p).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+              batch.set(doc(db, 'folders', folderDocId), { ...meta, userId: user.uid, updatedAt: Date.now() }, { merge: true });
+            }
+          });
+          await batch.commit();
+        } catch (e) {
+          console.error('Failed to update folder doc in firestore', e);
+        }
+      } else {
+        syncLocalFolderMetas(nextMetas);
+      }
+    }
+
+    // Update any open tab IDs that reference this folder
+    setOpenTaskIds(prev => prev.map(id => {
+      if (id === `folder:${oldFolderPath}`) return `folder:${newFolderPath}`;
+      if (id.startsWith(`folder:${oldFolderPath}/`)) return `folder:${newFolderPath}${id.slice(`folder:${oldFolderPath}`.length)}`;
+      return id;
+    }));
+    if (activeTabTaskId) {
+      if (activeTabTaskId === `folder:${oldFolderPath}`) {
+        setActiveTabTaskId(`folder:${newFolderPath}`);
+      } else if (activeTabTaskId.startsWith(`folder:${oldFolderPath}/`)) {
+        setActiveTabTaskId(`folder:${newFolderPath}${activeTabTaskId.slice(`folder:${oldFolderPath}`.length)}`);
+      }
+    }
+  };
+
+  const handleMoveFolder = async (sourceFolderPath: string, targetFolderPath: string) => {
+    if (!sourceFolderPath || sourceFolderPath === targetFolderPath) return;
+    if (targetFolderPath && targetFolderPath !== 'General' && targetFolderPath.startsWith(sourceFolderPath + '/')) {
+      setMessage({ 
+        text: L(
+          "親フォルダを自身の子フォルダ内に移動することはできません。",
+          "Cannot move a parent folder inside its own subfolder.",
+          "Impossible de déplacer un dossier parent dans son propre sous-dossier."
+        ), 
+        type: 'error' 
+      });
+      return;
+    }
+    const folderName = sourceFolderPath.split('/').pop() || sourceFolderPath;
+    const newPath = targetFolderPath === 'General' || !targetFolderPath ? folderName : `${targetFolderPath}/${folderName}`;
+    if (newPath === sourceFolderPath) return;
+    await handleRenameFolder(sourceFolderPath, newPath);
+
+    // Also sync localStorage customFolders
+    try {
+      const storageKey = `navfor_folders_${activeSection}`;
+      const saved = localStorage.getItem(storageKey);
+      if (saved) {
+        const folders: string[] = JSON.parse(saved);
+        const updated = folders.map(f => {
+          if (f === sourceFolderPath) return newPath;
+          if (f.startsWith(sourceFolderPath + '/')) return newPath + f.slice(sourceFolderPath.length);
+          return f;
+        });
+        localStorage.setItem(storageKey, JSON.stringify(updated));
+        window.dispatchEvent(new Event('navfor_folders_updated'));
+      }
+    } catch {}
+  };
+
+  const handleDeleteFolder = async (folderPath: string) => {
+    await handleTrashFolder(folderPath);
+  };
+
+  const pickDailyTasks = async (selectedIds: string[]) => {
+    if (!user) return;
+    const currentUrgentCount = tasks.filter(t => t.category === 'Urgent').length;
+    if (currentUrgentCount + selectedIds.length > settings.urgentLimit) {
+      setMessage({ 
+        text: `Daily Pick Violation: This batch would exceed the ${settings.urgentLimit} slot limit.`,
+        type: 'error'
+      });
+      return;
+    }
+
+    pushToHistory();
+    const now = Date.now();
+    if (user) {
+      try {
+        const batch = writeBatch(db);
+        selectedIds.forEach(id => {
+          batch.update(doc(db, 'tasks', id), { 
+            category: 'Urgent', 
+            updatedAt: now 
+          });
+        });
+        await batch.commit();
+        setIsPickingDaily(false);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, 'batch/tasks');
+      }
+    } else {
+      const idSet = new Set(selectedIds);
+      syncLocalTasks(tasks.map(t => idSet.has(t.id) ? { ...t, category: 'Urgent', updatedAt: now } : t));
+      setIsPickingDaily(false);
+    }
+  };
+
+  const handleSignIn = async (forceOpenModal = false) => {
+    if (forceOpenModal) {
+      setAuthModalError(null);
+      setIsAuthModalOpen(true);
+      return;
+    }
+    try {
+      await signIn();
+      setIsAuthModalOpen(false);
+      setAuthModalError(null);
+      setMessage({ text: L("Googleアカウントでログインしました。", "Signed in with Google account.", "Connecté avec un compte Google."), type: 'info' });
+    } catch (err: any) {
+      console.error("Sign in failed:", err);
+      setAuthModalError(err);
+      setIsAuthModalOpen(true);
+    }
+  };
+
+  const getCSVData = () => {
+    const currentTasks = tasksRef.current;
+    const currentSettings = settingsRef.current;
+    const headers = [
+      'ID', 'Category', 'Workspace', 'Project', 'Title', 'Notes', 'URLs',
+      'IsDone', 'IsStarred', 'IsPinned', 'StartDate', 'Deadline',
+      'TimelineColumn', 'TimelineStep', 'Recurrence', 'CreatedAt', 'UpdatedAt', 'UserID'
+    ];
+    const rows = currentTasks.map(t => [
+      t.id,
+      t.category,
+      t.section || currentSettings.sections[0] || 'General',
+      t.project,
+      t.title,
+      t.notes || '',
+      (t.urls || []).join('; '),
+      t.isDone ? 'Yes' : 'No',
+      t.isStarred ? 'Yes' : 'No',
+      t.isPinned ? 'Yes' : 'No',
+      t.startDate ? new Date(t.startDate).toISOString() : '',
+      t.deadline ? new Date(t.deadline).toISOString() : '',
+      t.timelineColumn || '',
+      t.timelineStep !== undefined && t.timelineStep !== null ? String(t.timelineStep) : '',
+      t.recurrence || '',
+      new Date(t.createdAt).toISOString(),
+      new Date(t.updatedAt).toISOString(),
+      t.userId || 'N/A'
+    ]);
+
+    const quote = (val: string) => `"${(val ?? '').toString().replace(/"/g, '""')}"`;
+
+    return [
+      headers.map(quote).join(','),
+      ...rows.map(r => r.map(quote).join(','))
+    ].join('\n');
+  };
+
+  const handleCSVImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !user) return;
+
+    // Automatic backup before import
+    await triggerEmergencyBackup();
+
+    Papa.parse(file, {
+      header: true,
+      skipEmptyLines: 'greedy',
+      transformHeader: (header) => header.replace(/^["']|["']$/g, '').trim().toLowerCase(),
+      complete: async (results) => {
+        try {
+          if (results.errors.length > 0) {
+            console.error('PapaParse Errors:', results.errors);
+          }
+
+          const batch = writeBatch(db);
+          let count = 0;
+          const foundWorkspaces = new Set<string>();
+
+          for (const row of results.data as any[]) {
+            // Helper to get value by case-insensitive key
+            const getVal = (key: string) => {
+              const val = row[key.toLowerCase()];
+              if (val === undefined || val === null) return '';
+              return val.toString().replace(/^["']|["']$/g, '').replace(/""/g, '"').trim();
+            };
+
+            const title = getVal('title');
+            if (!title) continue;
+
+            const sectionName = getVal('workspace') || getVal('section') || settings.sections[0] || 'General';
+            foundWorkspaces.add(sectionName);
+
+            const taskData: any = {
+              userId: user.uid,
+              category: (getVal('category') as Category) || 'Focus',
+              section: sectionName,
+              project: getVal('project') || 'Imported',
+              title,
+              notes: getVal('notes'),
+              urls: getVal('urls') ? getVal('urls').split(';').map(u => u.trim()).filter(Boolean) : [],
+              isDone: getVal('isdone').toLowerCase() === 'yes',
+              isStarred: getVal('isstarred').toLowerCase() === 'yes',
+              createdAt: (() => {
+                const val = getVal('createdat');
+                const t = val ? new Date(val).getTime() : Date.now();
+                return isNaN(t) ? Date.now() : t;
+              })(),
+              updatedAt: (() => {
+                const val = getVal('updatedat');
+                const t = val ? new Date(val).getTime() : Date.now();
+                return isNaN(t) ? Date.now() : t;
+              })(),
+            };
+
+            const d = getVal('deadline');
+            if (d) {
+              const t = new Date(d).getTime();
+              if (!isNaN(t)) {
+                taskData.deadline = t;
+              }
+            }
+
+            const newTaskRef = doc(collection(db, 'tasks'));
+            batch.set(newTaskRef, taskData);
+            count++;
+
+            if (count >= 499) break;
+          }
+
+          if (count === 0) {
+            setMessage({ text: "No valid tasks were found in the CSV. Please check the column headers.", type: 'error' });
+            return;
+          }
+
+          // Update settings with new workspaces if any
+          const missingWorkspaces = Array.from(foundWorkspaces).filter(s => s && !settings.sections.includes(s));
+          if (missingWorkspaces.length > 0) {
+            const updatedSections = [...settings.sections, ...missingWorkspaces];
+            await updateDoc(doc(db, 'settings', user.uid), { sections: updatedSections });
+          }
+
+          await batch.commit();
+          setMessage({ text: `Successfully imported ${count} tasks.`, type: 'info' });
+          e.target.value = '';
+        } catch (err) {
+          console.error('Import processing error:', err);
+          setMessage({ text: `Import failed: ${err instanceof Error ? err.message : 'Unknown error'}`, type: 'error' });
+        }
+      },
+      error: (err) => {
+        setMessage({ text: `CSV Parse Error: ${err.message}`, type: 'error' });
+      }
+    });
+  };
+
+  const getCurrentNextSlot = (): 1 | 2 | 3 => {
+    const slot = resolveDailyBackupSlot(backupSlotsRef.current, Date.now());
+    nextBackupSlotRef.current = slot;
+    return slot;
+  };
+
+  const getTasksSignature = () => {
+    const currentTasks = tasksRef.current;
+    const currentFolderMetas = folderMetasRef.current;
+    const taskPart = currentTasks
+      .map(t => `${t.id}:${t.updatedAt || 0}:${t.isDone ? 1 : 0}:${t.isStarred ? 1 : 0}:${t.isPinned ? 1 : 0}:${t.category}:${t.section || ''}:${t.project}:${t.title}:${t.notes || ''}:${(t.urls || []).join(',')}:${t.deadline || ''}:${t.startDate || ''}:${t.timelineColumn || ''}:${t.timelineStep ?? ''}:${t.recurrence || ''}`)
+      .sort()
+      .join('|');
+    const folderPart = Object.keys(currentFolderMetas)
+      .sort()
+      .map(k => {
+        const m = currentFolderMetas[k];
+        return `${k}:${m?.updatedAt || 0}:${m?.title || ''}:${m?.notes || ''}:${m?.deadline || ''}:${m?.startDate || ''}:${m?.isStarred ? 1 : 0}:${m?.isPinned ? 1 : 0}:${(m?.urls || []).join(',')}`;
+      })
+      .join('|');
+    const raw = `${taskPart}__${folderPart}`;
+    let h1 = 0xdeadbeef ^ raw.length;
+    let h2 = 0x41c6ce57 ^ raw.length;
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return `sig_${(h2 >>> 0).toString(16)}_${(h1 >>> 0).toString(16)}_${raw.length}_${currentTasks.length}`;
+  };
+
+  const syncBackupSlotsToCloud = (
+    slotsMap: Record<1 | 2 | 3, LocalBackupSlotInfo | null>,
+    syncTimestamp: number
+  ) => {
+    const currentUser = userRef.current;
+    if (!currentUser) return;
+    try {
+      const cleanSlots: Record<string, any> = {};
+      for (const s of [1, 2, 3] as const) {
+        const info = slotsMap[s];
+        if (info && info.writtenToDisk) {
+          cleanSlots[String(s)] = {
+            slot: info.slot,
+            fileName: info.fileName,
+            timestamp: info.timestamp,
+            taskCount: info.taskCount,
+            signature: info.signature || '',
+            writtenToDisk: true,
+          };
+        } else {
+          cleanSlots[String(s)] = null;
+        }
+      }
+      setDoc(
+        doc(db, 'settings', currentUser.uid),
+        {
+          userId: currentUser.uid,
+          ...settingsRef.current,
+          localBackupSlots: cleanSlots,
+          lastLocalSyncTime: syncTimestamp,
+        },
+        { merge: true }
+      ).catch(() => {});
+    } catch {}
+  };
+
+  const recordBackupSlot = (
+    slot: 1 | 2 | 3,
+    fileName: string,
+    csvContent: string,
+    taskCount: number,
+    signature: string,
+    now: number,
+    writtenToDisk = true
+  ) => {
+    const todayStr = format(new Date(now), 'yyyy-MM-dd');
+    // Keep saving to the same slot throughout the same calendar day; rotate to the next slot on the next day
+    const activeSlotForToday: 1 | 2 | 3 = slot;
+    nextBackupSlotRef.current = activeSlotForToday;
+    lastWrittenSignatureRef.current = signature;
+    lastWrittenDateRef.current = todayStr;
+
+    const slotInfo: LocalBackupSlotInfo = {
+      slot,
+      fileName,
+      timestamp: now,
+      taskCount,
+      signature,
+      writtenToDisk,
+    };
+
+    const updated: Record<1 | 2 | 3, LocalBackupSlotInfo | null> = {
+      ...backupSlotsRef.current,
+      [slot]: slotInfo,
+    };
+    backupSlotsRef.current = updated;
+
+    try {
+      localStorage.setItem('navfor_local_backup_slots', JSON.stringify(updated));
+      localStorage.setItem('navfor_local_backup_active_date', todayStr);
+      localStorage.setItem('navfor_local_backup_active_slot', String(activeSlotForToday));
+      localStorage.setItem('navfor_local_backup_next_slot', String(activeSlotForToday));
+      localStorage.setItem('trifocus_last_backup', String(now));
+    } catch (e) {
+      console.warn('Failed to store backup slot metadata in localStorage', e);
+    }
+
+    try {
+      localStorage.setItem(`navfor_local_backup_csv_${slot}`, csvContent);
+    } catch {}
+
+    setBackupSlots(updated);
+    setNextBackupSlot(activeSlotForToday);
+    setLastBackupTime(now);
+    setLastSyncTime(now);
+
+    if (writtenToDisk) {
+      syncBackupSlotsToCloud(updated, now);
+    }
+
+    if (backupChannelRef.current) {
+      try {
+        backupChannelRef.current.postMessage({
+          type: 'BACKUP_SLOTS_UPDATED',
+          slots: updated,
+          nextSlot: activeSlotForToday,
+          activeDate: todayStr,
+          lastSyncTime: now,
+          signature,
+        });
+      } catch {}
+    }
+  };
+
+  const writeCsvToDirHandle = async (
+    handle: FileSystemDirectoryHandle,
+    fileName: string,
+    csvContent: string,
+    userPart: string
+  ): Promise<{ written: boolean; lastModified?: number }> => {
+    let perm: 'granted' | 'prompt' | 'denied' = 'granted';
+    if (typeof (handle as any).queryPermission === 'function') {
+      perm = await (handle as any).queryPermission({ mode: 'readwrite' });
+      if (perm !== 'granted' && typeof (handle as any).requestPermission === 'function') {
+        try {
+          perm = await (handle as any).requestPermission({ mode: 'readwrite' });
+        } catch {
+          // User activation might not be active right now
+        }
+      }
+    }
+    dirPermissionRef.current = perm;
+    setDirPermission(perm);
+    if (perm !== 'granted') {
+      return { written: false };
+    }
+
+    const bomCsv = csvContent.startsWith('\uFEFF') ? csvContent : `\uFEFF${csvContent}`;
+    let fileHandle: FileSystemFileHandle | null = null;
+    let lastWriteErr: any = null;
+
+    // Retry up to 3 times in case another tab or OS indexer briefly locked the file
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        fileHandle = await handle.getFileHandle(fileName, { create: true });
+        const writable = await (fileHandle as any).createWritable({ keepExistingData: false });
+        await writable.write(bomCsv);
+        await writable.close();
+        lastWriteErr = null;
+        break;
+      } catch (err) {
+        lastWriteErr = err;
+        if (attempt < 2) {
+          await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
+        }
+      }
+    }
+
+    if (lastWriteErr) {
+      throw lastWriteErr;
+    }
+
+    let diskLastModified = Date.now();
+    try {
+      if (fileHandle) {
+        const diskFile = await fileHandle.getFile();
+        if (diskFile && diskFile.lastModified) {
+          diskLastModified = diskFile.lastModified;
+        }
+      }
+    } catch {}
+
+    // Remove legacy unnumbered file if present so only the max 3 numbered files remain
+    try {
+      if (typeof (handle as any).removeEntry === 'function') {
+        await (handle as any).removeEntry(`NavFOR_Log_${userPart}.csv`).catch(() => {});
+      }
+    } catch {}
+
+    return { written: true, lastModified: diskLastModified };
+  };
+
+  // Audit the actual files on disk inside dirHandle so UI timestamps always reflect real OS files
+  const verifyDiskBackupSlots = async (handle: FileSystemDirectoryHandle) => {
+    if (isWritingLocalRef.current) return;
+    try {
+      if (typeof (handle as any).queryPermission === 'function') {
+        const perm = await (handle as any).queryPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') return;
+      }
+      const hasAuthenticatedUser = Boolean(userRef.current?.email);
+      const userPart = userRef.current?.email?.split('@')[0] || 'local';
+      const prev = backupSlotsRef.current;
+      const diskTimestamps: Record<1 | 2 | 3, { fileName: string; lastModified: number } | null> = {
+        1: null,
+        2: null,
+        3: null,
+      };
+      const notFoundSlots: Record<1 | 2 | 3, boolean> = {
+        1: false,
+        2: false,
+        3: false,
+      };
+
+      for (const slotNum of [1, 2, 3] as const) {
+        const candidateNames = Array.from(
+          new Set(
+            [
+              `NavFOR_Log_${userPart}_${slotNum}.csv`,
+              prev[slotNum]?.fileName,
+            ].filter((x): x is string => Boolean(x))
+          )
+        );
+        let found = false;
+        let allNotFound = true;
+        for (const fName of candidateNames) {
+          try {
+            const fh = await handle.getFileHandle(fName, { create: false });
+            const file = await fh.getFile();
+            diskTimestamps[slotNum] = { fileName: fName, lastModified: file.lastModified || Date.now() };
+            found = true;
+            allNotFound = false;
+            break;
+          } catch (err: any) {
+            if (err?.name !== 'NotFoundError') {
+              allNotFound = false;
+            }
+          }
+        }
+        if (!found && allNotFound) {
+          notFoundSlots[slotNum] = true;
+        }
+      }
+
+      // Fallback directory scan if any slot wasn't matched directly (e.g. before auth finishes or custom email prefix)
+      if ((!diskTimestamps[1] || !diskTimestamps[2] || !diskTimestamps[3]) && typeof (handle as any).values === 'function') {
+        try {
+          for await (const entry of (handle as any).values()) {
+            if (entry && entry.kind === 'file' && typeof entry.name === 'string') {
+              const m = entry.name.match(/^NavFOR_Log_(.+)_([123])\.csv$/i);
+              if (m) {
+                const entryUser = m[1];
+                const slotNum = Number(m[2]) as 1 | 2 | 3;
+                if (!diskTimestamps[slotNum] && (!hasAuthenticatedUser || entryUser === userPart)) {
+                  try {
+                    const file = await entry.getFile();
+                    diskTimestamps[slotNum] = {
+                      fileName: entry.name,
+                      lastModified: file.lastModified || Date.now(),
+                    };
+                    notFoundSlots[slotNum] = false;
+                  } catch {}
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+
+      if (isWritingLocalRef.current) return;
+
+      const currentPrev = backupSlotsRef.current;
+      const next: Record<1 | 2 | 3, LocalBackupSlotInfo | null> = { 1: null, 2: null, 3: null };
+      let latestDiskSlot: LocalBackupSlotInfo | null = null;
+      const now = Date.now();
+
+      for (const slotNum of [1, 2, 3] as const) {
+        const diskInfo = diskTimestamps[slotNum];
+        const existing = currentPrev[slotNum];
+        if (diskInfo) {
+          const slotObj: LocalBackupSlotInfo = {
+            slot: slotNum,
+            fileName: diskInfo.fileName,
+            timestamp: Math.max(diskInfo.lastModified, existing?.fileName === diskInfo.fileName ? existing.timestamp : 0),
+            taskCount: existing?.taskCount ?? tasksRef.current.length,
+            signature: existing?.signature,
+            writtenToDisk: true,
+          };
+          next[slotNum] = slotObj;
+          if (!latestDiskSlot || slotObj.timestamp > latestDiskSlot.timestamp) {
+            latestDiskSlot = slotObj;
+          }
+        } else if (
+          existing &&
+          existing.writtenToDisk &&
+          (!hasAuthenticatedUser || !notFoundSlots[slotNum] || now - existing.timestamp < 5000)
+        ) {
+          // Preserve existing slot if user auth wasn't ready yet, or if a transient file read lock occurred
+          next[slotNum] = existing;
+          if (!latestDiskSlot || existing.timestamp > latestDiskSlot.timestamp) {
+            latestDiskSlot = existing;
+          }
+        } else {
+          next[slotNum] = null;
+        }
+      }
+
+      backupSlotsRef.current = next;
+      try {
+        localStorage.setItem('navfor_local_backup_slots', JSON.stringify(next));
+        if (!latestDiskSlot) {
+          if (hasAuthenticatedUser) {
+            localStorage.removeItem('navfor_local_backup_active_date');
+            localStorage.removeItem('navfor_local_backup_active_slot');
+          }
+        } else {
+          const latestDateStr = format(new Date(latestDiskSlot.timestamp), 'yyyy-MM-dd');
+          localStorage.setItem('navfor_local_backup_active_date', latestDateStr);
+          localStorage.setItem('navfor_local_backup_active_slot', String(latestDiskSlot.slot));
+          localStorage.setItem('trifocus_last_backup', String(latestDiskSlot.timestamp));
+        }
+      } catch {}
+
+      if (latestDiskSlot) {
+        if (latestDiskSlot.signature) {
+          lastWrittenSignatureRef.current = latestDiskSlot.signature;
+        }
+        lastWrittenDateRef.current = format(new Date(latestDiskSlot.timestamp), 'yyyy-MM-dd');
+        setLastSyncTime(prevTs => (!prevTs || latestDiskSlot!.timestamp > prevTs ? latestDiskSlot!.timestamp : prevTs));
+        setLastBackupTime(prevTs => (!prevTs || latestDiskSlot!.timestamp > prevTs ? latestDiskSlot!.timestamp : prevTs));
+        syncBackupSlotsToCloud(next, latestDiskSlot.timestamp);
+      } else if (hasAuthenticatedUser) {
+        lastWrittenSignatureRef.current = '';
+        lastWrittenDateRef.current = '';
+      }
+
+      const resolvedSlot = resolveDailyBackupSlot(next, Date.now());
+      nextBackupSlotRef.current = resolvedSlot;
+      setBackupSlots(next);
+      setNextBackupSlot(resolvedSlot);
+    } catch {}
+  };
+
+  const downloadBackupSlot = (slot: 1 | 2 | 3) => {
+    const userPart = user?.email?.split('@')[0] || 'local';
+    const slotInfo = backupSlots[slot];
+    const savedCsv = localStorage.getItem(`navfor_local_backup_csv_${slot}`);
+    const csv = savedCsv || getCSVData();
+    const fileName = slotInfo?.fileName || `NavFOR_Log_${userPart}_${slot}.csv`;
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', fileName);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadBackup = async () => {
+    const csv = getCSVData();
+    const userPart = user?.email?.split('@')[0] || 'local';
+    const slot: 1 | 2 | 3 = getCurrentNextSlot();
+    const fileName = `NavFOR_Log_${userPart}_${slot}.csv`;
+    const now = Date.now();
+    const signature = getTasksSignature();
+
+    try {
+      const activeHandle = dirHandleRef.current;
+      if (activeHandle) {
+        const res = await writeCsvToDirHandle(activeHandle, fileName, csv, userPart);
+        if (res.written) {
+          recordBackupSlot(slot, fileName, csv, tasksRef.current.length, signature, res.lastModified || now, true);
+          setMessage({
+            text: L(
+              `ローカルフォルダに ${fileName} を保存・上書きしました。`,
+              `Saved and overwritten ${fileName} in local folder.`,
+              `Fichier ${fileName} enregistré et écrasé dans le dossier local.`
+            ),
+            type: 'info'
+          });
+          return;
+        }
+      }
+
+      if ((window as any).showSaveFilePicker && window.self === window.top) {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName: fileName,
+          types: [{
+            description: 'CSV File',
+            accept: { 'text/csv': ['.csv'] },
+          }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(csv);
+        await writable.close();
+      } else {
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.setAttribute('href', url);
+        link.setAttribute('download', fileName);
+        link.style.visibility = 'hidden';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      }
+      
+      recordBackupSlot(slot, fileName, csv, tasks.length, signature, now);
+      if (!settings.isLocalBackupEnabled || !settings.localBackupPath) {
+        await saveSettings({
+          isLocalBackupEnabled: true,
+          localBackupPath: settings.localBackupPath || 'Local_Backup_Folder'
+        });
+      }
+      setMessage({
+        text: L(
+          `バックアップ (#${slot}: ${fileName}) を保存しました。`,
+          `Backup (#${slot}: ${fileName}) saved successfully.`,
+          `Sauvegarde (#${slot} : ${fileName}) enregistrée.`
+        ),
+        type: 'info'
+      });
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        console.error("Backup Save Error", err);
+        setMessage({ text: `Save Failed: ${err.message}`, type: 'error' });
+      }
+    }
+  };
+
+  const selectBackupFolder = async () => {
+    try {
+      if (!window.showDirectoryPicker) {
+        await saveSettings({
+          localBackupPath: settings.localBackupPath || 'Browser_Local_Log (Max 3)',
+          isLocalBackupEnabled: true
+        });
+        await syncToLocalSystem(true);
+        setMessage({ 
+          text: L(
+            'ローカルログ設定を有効化しました（最大3ファイルのローテーション保存）。',
+            'Local log backup enabled (rotating up to 3 backup files).',
+            'Sauvegarde locale activée (rotation sur 3 fichiers max).'
+          ),
+          type: 'info'
+        });
+        return;
+      }
+      const handle = await window.showDirectoryPicker({
+        mode: 'readwrite'
+      });
+      dirHandleRef.current = handle;
+      dirPermissionRef.current = 'granted';
+      setDirHandle(handle);
+      setDirPermission('granted');
+      await saveDirHandleToIDB(handle);
+      if (backupChannelRef.current) {
+        try {
+          backupChannelRef.current.postMessage({ type: 'DIR_HANDLE_UPDATED', handle });
+        } catch {}
+      }
+      
+      await saveSettings({ 
+        localBackupPath: handle.name, 
+        isLocalBackupEnabled: true 
+      });
+
+      // Verify existing numbered files in the folder first
+      await verifyDiskBackupSlots(handle);
+
+      // Immediately write/overwrite initial numbered backup in the selected folder
+      const csvContent = getCSVData();
+      const userPart = userRef.current?.email?.split('@')[0] || 'local';
+      const slot: 1 | 2 | 3 = getCurrentNextSlot();
+      const fileName = `NavFOR_Log_${userPart}_${slot}.csv`;
+      const now = Date.now();
+      const res = await writeCsvToDirHandle(handle, fileName, csvContent, userPart);
+      if (res.written) {
+        recordBackupSlot(slot, fileName, csvContent, tasksRef.current.length, getTasksSignature(), res.lastModified || now, true);
+      }
+      setMessage({
+        text: L(
+          `保存先フォルダ「${handle.name}」を設定し、${fileName} をローカルに保存・上書きしました。`,
+          `Configured folder "${handle.name}" and saved ${fileName} locally.`,
+          `Dossier « ${handle.name} » configuré et ${fileName} enregistré.`
+        ),
+        type: 'info'
+      });
+    } catch (err: any) {
+      if (err.name === 'SecurityError' || err.message?.includes('Cross origin sub frames')) {
+        setMessage({ 
+          text: L(
+            'プレビュー枠内ではブラウザの制限によりPCフォルダ選択ダイアログを開けません。右上の「新しいタブで開く (↗)」から一度フォルダを選択すると、以降すべての変更がローカルファイルに自動上書きされます。',
+            'Browser security restricts opening the folder picker inside a preview frame. Please click "Open in New Tab (↗)" once to select your PC folder.',
+            'Veuillez ouvrir l\'application dans un nouvel onglet (↗) pour sélectionner votre dossier local.'
+          ),
+          type: 'error'
+        });
+      } else if (err.name !== 'AbortError') {
+        setMessage({ text: `Folder selection failed: ${err.message}`, type: 'error' });
+      }
+    }
+  };
+
+  const authorizeLocalFolderNow = async () => {
+    const currentHandle = dirHandleRef.current || (await refreshDirHandleFromIDB());
+    if (!currentHandle) {
+      await selectBackupFolder();
+      return;
+    }
+    try {
+      let perm: 'granted' | 'prompt' | 'denied' = 'granted';
+      if (typeof (currentHandle as any).requestPermission === 'function') {
+        perm = await (currentHandle as any).requestPermission({ mode: 'readwrite' });
+      }
+      dirPermissionRef.current = perm;
+      setDirPermission(perm);
+      if (perm === 'granted') {
+        await verifyDiskBackupSlots(currentHandle);
+        lastWrittenSignatureRef.current = '';
+        await syncToLocalSystem(true);
+      } else {
+        setMessage({
+          text: L(
+            'ローカルフォルダへの書き込み許可が拒否されました。もう一度クリックして許可してください。',
+            'Write permission was not granted. Please click again and allow access.',
+            'Autorisation d\'écriture refusée. Veuillez réessayer.'
+          ),
+          type: 'error'
+        });
+      }
+    } catch (err: any) {
+      await selectBackupFolder();
+    }
+  };
+
+  const syncToLocalSystem = async (manual = false, customName?: string) => {
+    const currentSettings = settingsRef.current;
+    const currentTasks = tasksRef.current;
+    const configured = Boolean(currentSettings.isLocalBackupEnabled && currentSettings.localBackupPath);
+    if ((!configured && !manual) || (!tasksLoadedRef.current && currentTasks.length === 0 && !manual)) {
+      return;
+    }
+
+    let activeHandle = dirHandleRef.current;
+    if (!activeHandle) {
+      activeHandle = await refreshDirHandleFromIDB();
+    }
+
+    // If user clicked manual sync in a top-level browser window and dirHandle is not yet bound, prompt folder picker
+    if (manual && !activeHandle && window.showDirectoryPicker && window.self === window.top) {
+      await selectBackupFolder();
+      return;
+    }
+
+    // If a local folder handle is required (browser supports File System Access API) and we don't have one yet,
+    // do NOT fake-update the timestamps in Settings!
+    if (!activeHandle && typeof window.showDirectoryPicker === 'function') {
+      if (manual) {
+        await selectBackupFolder();
+      }
+      return;
+    }
+
+    if (isWritingLocalRef.current) {
+      pendingSyncAfterWriteRef.current = true;
+      return;
+    }
+
+    const slot: 1 | 2 | 3 = getCurrentNextSlot();
+    const signature = getTasksSignature();
+    if (!manual && !customName) {
+      if (lastWrittenSignatureRef.current === signature && backupSlotsRef.current[slot] !== null) {
+        return;
+      }
+    }
+
+    isWritingLocalRef.current = true;
+    setIsSyncing(true);
+    try {
+      const csvContent = getCSVData();
+      const userPart = userRef.current?.email?.split('@')[0] || 'local';
+      const fileName = customName || `NavFOR_Log_${userPart}_${slot}.csv`;
+      const now = Date.now();
+
+      if (activeHandle) {
+        const res = await writeCsvToDirHandle(activeHandle, fileName, csvContent, userPart);
+        if (!res.written) {
+          // Permission is still 'prompt' (waiting for user gesture); do not advance slot or fake timestamp!
+          if (manual) {
+            setMessage({
+              text: L(
+                'ローカルフォルダへの書き込み許可が必要です。もう一度クリックして許可してください。',
+                'Write permission is needed for the local folder. Please click again to allow.',
+                'Autorisation d\'écriture requise pour le dossier local.'
+              ),
+              type: 'error'
+            });
+          }
+          return;
+        }
+        recordBackupSlot(slot, fileName, csvContent, currentTasks.length, signature, Math.max(res.lastModified || 0, now), true);
+      } else {
+        // Fallback only for browsers without showDirectoryPicker support (e.g. mobile/Safari)
+        recordBackupSlot(slot, fileName, csvContent, currentTasks.length, signature, now, false);
+      }
+
+      if (manual) {
+        setMessage({
+          text: customName
+            ? `Emergency backup created: ${fileName}`
+            : L(
+                `ローカルログ (#${slot}: ${fileName}) をローカルフォルダに保存・上書きしました。`,
+                `Local log backup (#${slot}: ${fileName}) saved & overwritten in local folder.`,
+                `Journal local (#${slot} : ${fileName}) enregistré et écrasé.`
+              ),
+          type: 'info'
+        });
+      }
+    } catch (err: any) {
+      console.error("Local backup failed", err);
+      // If another tab was writing to the file at the same instant, audit the disk after a short delay to pick up the updated timestamp
+      if (activeHandle) {
+        setTimeout(() => {
+          verifyDiskBackupSlots(activeHandle!);
+        }, 300);
+      }
+      if (manual) {
+        setMessage({ 
+          text: `Local Backup Error: ${err.message}.`,
+          type: 'error'
+        });
+      }
+    } finally {
+      isWritingLocalRef.current = false;
+      setIsSyncing(false);
+      if (pendingSyncAfterWriteRef.current) {
+        pendingSyncAfterWriteRef.current = false;
+        setTimeout(() => {
+          syncToLocalSystem(false);
+        }, 50);
+      } else if (activeHandle) {
+        // Audit any other existing slot files on disk so all 3 slots stay in sync with OS disk
+        verifyDiskBackupSlots(activeHandle);
+      }
+    }
+  };
+
+  // When dirHandle is ready and permission is granted (and auth has finished loading), audit real files on disk and immediately sync if needed
+  useEffect(() => {
+    if (!authLoading && dirHandle && dirPermission === 'granted') {
+      verifyDiskBackupSlots(dirHandle).then(() => {
+        if (isLocalLogConfigured && (tasksLoadedRef.current || tasksRef.current.length > 0)) {
+          syncToLocalSystem(false);
+        }
+      });
+    }
+  }, [authLoading, user?.email, dirHandle, dirPermission, isLocalLogConfigured]);
+
+  // Also refresh disk slot timestamps whenever Sync Active popup or Settings view is opened
+  useEffect(() => {
+    if ((showSyncDetails || viewMode === 'settings' || mobileView === 'settings') && !authLoading && dirHandle && dirPermission === 'granted') {
+      verifyDiskBackupSlots(dirHandle).then(() => {
+        const currentSlot = getCurrentNextSlot();
+        if (isLocalLogConfigured && !backupSlotsRef.current[currentSlot] && (tasksLoadedRef.current || tasksRef.current.length > 0)) {
+          syncToLocalSystem(false);
+        }
+      });
+    }
+  }, [showSyncDetails, viewMode, mobileView, authLoading, dirHandle, dirPermission, isLocalLogConfigured]);
+
+  // Auto-sync effect: immediately saves & overwrites today's numbered file on every task/folder change
+  useEffect(() => {
+    if (!authLoading && isLocalLogConfigured && (tasksLoadedRef.current || tasks.length > 0)) {
+      const isForeground = document.visibilityState === 'visible' && (typeof document.hasFocus !== 'function' || document.hasFocus());
+      const delayMs = isForeground ? 150 : 800;
+      const timer = setTimeout(() => {
+        syncToLocalSystem(false);
+      }, delayMs);
+      return () => clearTimeout(timer);
+    }
+  }, [tasks, folderMetas, authLoading, isLocalLogConfigured, dirHandle, dirPermission, isIdbLoaded]);
+
+  // Safari/PWA Persistence Request
+  useEffect(() => {
+    if (navigator.storage && navigator.storage.persist) {
+      navigator.storage.persist().then(granted => {
+        if (granted) console.log("Storage persistence granted");
+      });
+    }
+  }, []);
+
+  // Done to Trash Auto-Move Effect
+  useEffect(() => {
+    if (!user || settings.doneToTrashThresholdDays === 99999) return;
+
+    const cleanup = async () => {
+      const now = Date.now();
+      const thresholdMs = settings.doneToTrashThresholdDays * 24 * 60 * 60 * 1000;
+      
+      const tasksToTrash = tasks.filter(t => 
+        t.isDone && 
+        t.category !== 'Archive' && 
+        t.category !== 'Trash' && 
+        (t.updatedAt || t.createdAt) < (now - thresholdMs)
+      );
+
+      if (tasksToTrash.length > 0) {
+        console.log(`Auto-moving ${tasksToTrash.length} done tasks to trash`);
+        try {
+          const batch = writeBatch(db);
+          tasksToTrash.forEach(t => {
+            batch.update(doc(db, 'tasks', t.id), { 
+              category: 'Trash',
+              updatedAt: now 
+            });
+          });
+          await batch.commit();
+        } catch (err) {
+          console.error("Auto-trash error", err);
+        }
+      }
+    };
+
+    const timer = setTimeout(cleanup, 10000); // Wait 10s after load/change
+    return () => clearTimeout(timer);
+  }, [tasks, settings.doneToTrashThresholdDays, user]);
+
+  // ToDo to Archive Auto-Move Effect
+  useEffect(() => {
+    if (!user || settings.archiveThresholdDays === 99999) return;
+
+    const cleanup = async () => {
+      const now = Date.now();
+      const thresholdMs = settings.archiveThresholdDays * 24 * 60 * 60 * 1000;
+      
+      const tasksToArchive = tasks.filter(t => 
+        t.category !== 'Archive' && 
+        t.category !== 'Trash' && 
+        (t.updatedAt || t.createdAt) < (now - thresholdMs)
+      );
+
+      if (tasksToArchive.length > 0) {
+        console.log(`Auto-archiving ${tasksToArchive.length} inactive tasks`);
+        try {
+          const batch = writeBatch(db);
+          tasksToArchive.forEach(t => {
+            batch.update(doc(db, 'tasks', t.id), { 
+              category: 'Archive',
+              updatedAt: now 
+            });
+          });
+          await batch.commit();
+        } catch (err) {
+          console.error("Auto-archive error", err);
+        }
+      }
+    };
+
+    const timer = setTimeout(cleanup, 12000); // Wait 12s (staggered with done-to-trash)
+    return () => clearTimeout(timer);
+  }, [tasks, settings.archiveThresholdDays, user]);
+
+  // Trash Auto-Cleanup Effect
+  useEffect(() => {
+    if (!user || tasks.length === 0 || settings.trashCleanupThresholdDays === 99999) return;
+
+    const cleanupTrash = async () => {
+      const now = Date.now();
+      const thresholdMs = settings.trashCleanupThresholdDays * 24 * 60 * 60 * 1000;
+      const expiredTrash = tasks.filter(t => t.category === 'Trash' && (now - t.updatedAt) > thresholdMs);
+      
+      if (expiredTrash.length > 0) {
+        try {
+          const batch = writeBatch(db);
+          expiredTrash.forEach(t => {
+            batch.delete(doc(db, 'tasks', t.id));
+          });
+          await batch.commit();
+          console.log(`Auto-cleaned ${expiredTrash.length} expired trash items.`);
+        } catch (err) {
+          console.error("Auto-cleanup trash failed", err);
+        }
+      }
+    };
+
+    const timer = setTimeout(cleanupTrash, 10000); // Run once shortly after load
+    return () => clearTimeout(timer);
+  }, [user, tasks, settings.trashCleanupThresholdDays]);
+
+  // Archive Done to Trash Auto-Move Effect
+  useEffect(() => {
+    if (!user || settings.archiveDoneToTrashDays === 99999) return;
+
+    const cleanup = async () => {
+      const now = Date.now();
+      const thresholdMs = settings.archiveDoneToTrashDays * 24 * 60 * 60 * 1000;
+      
+      const tasksToTrash = tasks.filter(t => 
+        t.category === 'Archive' &&
+        t.isDone && 
+        (t.updatedAt || t.createdAt) < (now - thresholdMs)
+      );
+
+      if (tasksToTrash.length > 0) {
+        console.log(`Auto-moving ${tasksToTrash.length} done archive tasks to trash`);
+        try {
+          const batch = writeBatch(db);
+          tasksToTrash.forEach(t => {
+            batch.update(doc(db, 'tasks', t.id), { 
+              category: 'Trash',
+              updatedAt: now 
+            });
+          });
+          await batch.commit();
+        } catch (err) {
+          console.error("Auto-trash archive error", err);
+        }
+      }
+    };
+
+    const timer = setTimeout(cleanup, 11000); // Staggered timer
+    return () => clearTimeout(timer);
+  }, [tasks, settings.archiveDoneToTrashDays, user]);
+
+  // Archive Inactive to Trash Auto-Move Effect
+  useEffect(() => {
+    if (!user || settings.archiveInactiveToTrashDays === 99999) return;
+
+    const cleanup = async () => {
+      const now = Date.now();
+      const thresholdMs = settings.archiveInactiveToTrashDays * 24 * 60 * 60 * 1000;
+      
+      const tasksToTrash = tasks.filter(t => 
+        t.category === 'Archive' &&
+        (t.updatedAt || t.createdAt) < (now - thresholdMs)
+      );
+
+      if (tasksToTrash.length > 0) {
+        console.log(`Auto-moving ${tasksToTrash.length} inactive archive tasks to trash`);
+        try {
+          const batch = writeBatch(db);
+          tasksToTrash.forEach(t => {
+            batch.update(doc(db, 'tasks', t.id), { 
+              category: 'Trash',
+              updatedAt: now 
+            });
+          });
+          await batch.commit();
+        } catch (err) {
+          console.error("Auto-trash inactive archive error", err);
+        }
+      }
+    };
+
+    const timer = setTimeout(cleanup, 13000); // Staggered timer
+    return () => clearTimeout(timer);
+  }, [tasks, settings.archiveInactiveToTrashDays, user]);
+
+  const cleanupArchive = async (thresholdDays?: number) => {
+    if (!user) return;
+    try {
+      const now = Date.now();
+      
+      let activeThreshold = thresholdDays;
+      if (!activeThreshold) {
+        if (archiveFilter === '1m') activeThreshold = 30;
+        else if (archiveFilter === '3m') activeThreshold = 90;
+        else if (archiveFilter === '6m') activeThreshold = 180;
+        else if (archiveFilter === '1y') activeThreshold = 365;
+      }
+      
+      const cutoff = activeThreshold ? now - (activeThreshold * 24 * 60 * 60 * 1000) : null;
+      
+      // Respect project and section filters by using filteredTasks
+      const archiveTasks = filteredTasks.filter(t => {
+        if (t.category !== 'Archive') return false;
+        if (!cutoff) return true;
+        return (t.updatedAt || t.createdAt) < cutoff;
+      });
+
+      if (archiveTasks.length === 0) {
+        setMessage({ text: "No tasks match current filter criteria.", type: 'info' });
+        return;
+      }
+
+      if (!window.confirm(`Move ${archiveTasks.length} archived items matching current filters to Trash?`)) return;
+      
+      pushToHistory();
+
+      const batch = writeBatch(db);
+      archiveTasks.forEach(task => {
+        batch.update(doc(db, 'tasks', task.id), { 
+          category: 'Trash',
+          updatedAt: Date.now()
+        });
+      });
+      await batch.commit();
+      setMessage({ text: `Archive cleanup complete: ${archiveTasks.length} items moved to Trash.`, type: 'info' });
+    } catch (err: any) {
+      console.error("Archive cleanup error", err);
+      setMessage({ text: `Archive Error: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const triggerEmergencyBackup = async () => {
+    const userPart = user?.email?.split('@')[0] || 'user';
+    const backupName = `NavFOR_Log_${userPart}_backup.csv`;
+    
+    if (settings.isLocalBackupEnabled && dirHandle) {
+      await syncToLocalSystem(true, backupName);
+    } else {
+      // Fallback to browser download if sync not active
+      exportTasks(backupName);
+    }
+  };
+
+  const purgeAllData = async () => {
+    if (!user) return;
+    if (!window.confirm("CRITICAL: FULL CLOUD PURGE. This will delete EVERY task and reset your workspaces to default. A backup will be attempted first. Proceed?")) return;
+
+    try {
+      pushToHistory();
+      await triggerEmergencyBackup();
+      setMessage({ text: "Purge started. Clearing cloud data and resetting workspaces...", type: 'info' });
+      
+      const snap = await getDocs(query(collection(db, 'tasks'), where('userId', '==', user.uid)));
+      
+      let successCount = 0;
+      let failCount = 0;
+
+      for (const d of snap.docs) {
+        try {
+          await deleteDoc(d.ref);
+          successCount++;
+        } catch (err) {
+          console.error(`Failed to delete doc ${d.id}:`, err);
+          failCount++;
+        }
+      }
+
+      // Reset workspaces/sections to General
+      await updateDoc(doc(db, 'settings', user.uid), {
+        sections: ['General']
+      });
+
+      localStorage.clear();
+      sessionStorage.clear();
+      
+      setMessage({ text: `Purge ended: ${successCount} tasks deleted. Workspaces reset to General.`, type: 'info' });
+      
+      setTimeout(async () => {
+        const { clearFirestoreCache } = await import('./lib/firebase');
+        await clearFirestoreCache();
+        window.location.reload();
+      }, 3000);
+      
+    } catch (err: any) {
+      console.error("Purge Error:", err);
+      setMessage({ text: `Purge Error: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const purgeSectionData = async () => {
+    if (!user || !activeSection) return;
+    if (!window.confirm(`Are you sure you want to delete ALL tasks in the workspace "${activeSection}"? A backup will be attempted first.`)) return;
+
+    try {
+      pushToHistory();
+      await triggerEmergencyBackup();
+      setMessage({ text: `Purging workspace "${activeSection}"...`, type: 'info' });
+
+      const workspaceTasks = tasks.filter(t => t.section === activeSection || (!t.section && activeSection === settings.sections[0]));
+      
+      let successCount = 0;
+      let failCount = 0;
+
+      for (const t of workspaceTasks) {
+        try {
+          await deleteDoc(doc(db, 'tasks', t.id));
+          successCount++;
+        } catch (err) {
+          console.error(`Failed to delete task ${t.id}:`, err);
+          failCount++;
+        }
+      }
+
+      setMessage({ text: `Workspace Purge Complete: ${successCount} deleted, ${failCount} failed.`, type: 'info' });
+    } catch (err: any) {
+      console.error("Workspace Purge Error:", err);
+      setMessage({ text: `Purge Error: ${err.message}`, type: 'error' });
+    }
+  };
+
+  const forceResetSettings = async () => {
+    if (!user) return;
+    if (!window.confirm("RESET SETTINGS: This will reset all thresholds, limits, and cleanup preferences to factory defaults. Your workspaces and tasks will NOT be affected. Proceed?")) return;
+
+    try {
+      setMessage({ text: "Resetting system settings...", type: 'info' });
+      
+      const defaultThresholds = {
+        urgentLimit: 3,
+        deadlineThreshold: 3,
+        archiveThresholdDays: 99999,
+        doneToTrashThresholdDays: 7,
+        trashCleanupThresholdDays: 30,
+        archiveDoneToTrashDays: 7,
+        archiveInactiveToTrashDays: 99999,
+        criticalThreshold: 100
+      };
+
+      await updateDoc(doc(db, 'settings', user.uid), defaultThresholds);
+      
+      // Update local state too to avoid full reload if possible, but the current code reloads.
+      // Let's stick to reload for consistency with how it clear caches.
+      
+      localStorage.removeItem('trifocus_last_backup');
+      
+      setTimeout(() => {
+        window.location.reload();
+      }, 1500);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `settings/${user.uid}`);
+    }
+  };
+
+  const exportTasks = (fileName?: string) => {
+    try {
+      const csvContent = getCSVData();
+      const userPart = user?.email?.split('@')[0] || 'user';
+      const defaultName = fileName || `TaskManager_Export_${format(new Date(), 'yyyyMMdd_HHmm')}.csv`;
+
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', defaultName);
+      link.style.visibility = 'hidden';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setMessage({ text: 'Export Failed: An error occurred while generating the CSV.', type: 'error' });
+    }
+  };
+
+  const toggleProjectCollapse = (project: string) => {
+    setCollapsedProjects(prev => {
+      const next = new Set(prev);
+      if (next.has(project)) next.delete(project);
+      else next.add(project);
+      return next;
+    });
+  };
+
+  if (authLoading) {
+    return (
+      <div className="h-screen w-full bg-[#f8fafc] text-slate-800 flex flex-col items-center justify-center font-sans">
+        <div className="w-10 h-10 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mb-4" />
+        <p className="text-xs font-bold uppercase tracking-widest text-slate-500">
+          {L('NavFOR 認証状態を確認中...', 'Checking NavFOR authentication...', "Vérification de l'authentification NavFOR...")}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-screen w-full bg-[#f8fafc] text-slate-800 flex flex-col font-sans overflow-hidden">
+      {/* Toast Messages */}
+      <AnimatePresence>
+        {message && (
+          <motion.div 
+            initial={{ opacity: 0, y: 50, x: '-50%' }}
+            animate={{ opacity: 1, y: 0, x: '-50%' }}
+            exit={{ opacity: 0, y: 20, x: '-50%' }}
+            className={cn(
+              "fixed bottom-12 left-1/2 z-[100] text-white px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-4 min-w-[320px] max-w-md transition-colors",
+              message.type === 'error' ? "bg-red-600" : "bg-indigo-600 shadow-indigo-200/50"
+            )}
+          >
+            <div className="w-10 h-10 bg-white/20 rounded-full flex items-center justify-center shrink-0">
+              {message.type === 'error' ? <Zap size={20} className="text-white fill-white" /> : <CheckCircle2 size={20} className="text-white" />}
+            </div>
+            <div className="flex-1">
+              <p className="text-[10px] font-black uppercase tracking-widest opacity-70 mb-0.5">
+                {message.type === 'error' ? 'System Exception' : 'Notification'}
+              </p>
+              <p className="text-sm font-bold leading-tight">{message.text}</p>
+              {message.text.toLowerCase().includes("open in new tab") && (
+                <button 
+                  onClick={() => window.open(window.location.href, '_blank')}
+                  className="mt-2 px-3 py-1 bg-white text-indigo-600 text-[10px] font-black uppercase rounded shadow-sm hover:bg-slate-50 transition-all font-mono"
+                >
+                  Open in New Tab
+                </button>
+              )}
+            </div>
+            <button onClick={() => setMessage(null)} className="p-1 hover:bg-white/10 rounded">
+              <X size={16} />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Header Navigation */}
+      <header className={cn(
+        "bg-white border-b border-slate-200 px-2.5 sm:px-4 xl:px-6 py-2.5 md:py-3.5 flex justify-between items-center gap-2 shrink-0 relative z-[100] max-w-full",
+        isEffectiveTimelineFullscreen && "hidden"
+      )}>
+        {/* Left Side: Logo & Workspace Menu */}
+        <div className="flex items-center gap-2 sm:gap-4 min-w-0 shrink overflow-hidden">
+          <div className="relative min-w-0 max-w-full">
+            {user ? (
+              <button 
+                onClick={() => setShowSectionMenu(!showSectionMenu)}
+                className="flex items-center gap-1.5 sm:gap-2 hover:opacity-80 transition-opacity cursor-pointer group min-w-0 max-w-full"
+              >
+                <div className="w-7 h-7 sm:w-8 sm:h-8 bg-white rounded-lg flex items-center justify-center transition-transform shadow-lg shadow-indigo-100 group-active:scale-95 overflow-hidden border border-slate-100 shrink-0">
+                  <img src={`${(import.meta as any).env?.BASE_URL || '/'}icon-192.png`} alt="Logo" className="w-full h-full object-contain" referrerPolicy="no-referrer" />
+                </div>
+                <div className="flex flex-col items-start leading-none min-w-0 overflow-hidden">
+                  <h1 className="text-xs sm:text-sm font-black tracking-tighter text-slate-800 uppercase whitespace-nowrap truncate max-w-full">
+                    NavFOR <span className="text-indigo-600">v{APP_VERSION}</span>
+                  </h1>
+                  <p className="text-[9px] sm:text-[10px] font-bold text-indigo-500 uppercase tracking-widest flex items-center gap-0.5 min-w-0 max-w-full">
+                    <span className="truncate max-w-[80px] sm:max-w-[110px]">{activeSection}</span> <ChevronDown size={10} className={cn("transition-transform shrink-0", showSectionMenu && "rotate-180")} />
+                  </p>
+                </div>
+              </button>
+            ) : (
+              <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 max-w-full">
+                <div className="w-7 h-7 sm:w-8 sm:h-8 bg-white rounded-lg flex items-center justify-center shadow-lg shadow-indigo-100 overflow-hidden border border-slate-100 shrink-0">
+                  <img src={`${(import.meta as any).env?.BASE_URL || '/'}icon-192.png`} alt="Logo" className="w-full h-full object-contain" referrerPolicy="no-referrer" />
+                </div>
+                <div className="flex flex-col items-start leading-none min-w-0 overflow-hidden">
+                  <h1 className="text-xs sm:text-sm font-black tracking-tighter text-slate-800 uppercase whitespace-nowrap truncate max-w-full">
+                    NavFOR <span className="text-indigo-600">v{APP_VERSION}</span>
+                  </h1>
+                  <p className="text-[9px] sm:text-[10px] font-bold text-slate-400 uppercase tracking-widest truncate">
+                    Cloud Workspace
+                  </p>
+                </div>
+              </div>
+            )}
+            {user && showSectionMenu && (
+              <>
+                <div className="fixed inset-0 z-[55]" onClick={() => setShowSectionMenu(false)} />
+                <div className="absolute top-full left-0 mt-2 w-64 bg-white border border-slate-200 rounded-2xl shadow-2xl z-[60] py-2 overflow-hidden">
+                  <div className="px-4 py-2 border-b border-slate-50 flex items-center justify-between bg-slate-50/50">
+                    <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Workspaces</p>
+                    <button 
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const name = window.prompt("New Workspace Name?");
+                        if (name) addSection(name);
+                        setShowSectionMenu(false);
+                      }}
+                      className="text-indigo-600 hover:text-indigo-700 p-1 bg-white rounded-lg border border-indigo-100 shadow-sm"
+                    >
+                      <Plus size={14} />
+                    </button>
+                  </div>
+                  <DragDropContext onDragEnd={onSectionDragEnd}>
+                    <Droppable droppableId="sections">
+                      {(provided) => (
+                        <div {...provided.droppableProps} ref={provided.innerRef} className="max-h-[350px] overflow-y-auto custom-scrollbar">
+                          {settings.sections.map((s, index) => (
+                            <Draggable key={s} draggableId={s} index={index}>
+                              {(provided, snapshot) => (
+                                <div 
+                                  ref={provided.innerRef}
+                                  {...provided.draggableProps}
+                                  className={cn(
+                                    "group/item flex items-center border-b border-slate-50 last:border-0",
+                                    snapshot.isDragging && "bg-white shadow-xl border border-indigo-200 rounded-lg z-[100]"
+                                  )}
+                                >
+                                  <div {...provided.dragHandleProps} className="pl-3 pr-1 text-slate-300 hover:text-slate-400 cursor-grab active:cursor-grabbing">
+                                    <GripVertical size={14} />
+                                  </div>
+                                  <button 
+                                    onClick={() => {
+                                      setActiveSection(s);
+                                      setShowSectionMenu(false);
+                                    }}
+                                    className={cn(
+                                      "flex-1 text-left px-2 py-3.5 text-xs font-bold transition-all flex items-center justify-between",
+                                      activeSection === s ? "text-indigo-600" : "text-slate-600 hover:bg-slate-50"
+                                    )}
+                                  >
+                                    <span className="flex items-center gap-2">
+                                       <div className={cn("w-1.5 h-1.5 rounded-full", activeSection === s ? "bg-indigo-500" : "bg-slate-200")} />
+                                       {s}
+                                    </span>
+                                    {activeSection === s && <CheckCircle2 size={12} />}
+                                  </button>
+                                  <div className="flex px-2 md:opacity-0 group-hover/item:opacity-100 transition-opacity gap-1">
+                                    <button 
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        const name = window.prompt(t('RenameWorkspace'), s);
+                                        if (name) renameSection(s, name);
+                                      }}
+                                      className="p-1.5 hover:bg-indigo-50 hover:text-indigo-600 text-slate-300 rounded"
+                                    >
+                                      <SettingsIcon size={12} />
+                                    </button>
+                                    <button 
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        deleteSection(s);
+                                        if (activeSection === s) setShowSectionMenu(false);
+                                      }}
+                                      className="p-1.5 hover:bg-red-50 hover:text-red-600 text-slate-300 rounded"
+                                    >
+                                      <Trash2 size={12} />
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                            </Draggable>
+                          ))}
+                          {provided.placeholder}
+                        </div>
+                      )}
+                    </Droppable>
+                  </DragDropContext>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Right Side: Desktop Nav & Tools & User */}
+        <div className="flex items-center gap-1 sm:gap-1.5 xl:gap-2 shrink-0">
+          {user && (
+            <>
+              {/* Desktop/Tablet Dashboard/Archive/Trash/Settings Buttons */}
+              <nav className="hidden lg:flex items-center gap-0.5 xl:gap-1 bg-slate-50 p-1 rounded-xl border border-slate-100 mr-1 xl:mr-2 shrink-0">
+                <button 
+                  onClick={() => setViewMode('dashboard')}
+                  className={cn(
+                    "px-2.5 xl:px-4 py-1.5 rounded-lg text-[10px] xl:text-[11px] font-black uppercase tracking-tighter transition-all whitespace-nowrap",
+                    viewMode === 'dashboard' ? "bg-white text-indigo-600 shadow-sm border border-indigo-50" : "text-slate-400 hover:text-slate-600"
+                  )}
+                >
+                  {t('Dashboard')}
+                </button>
+                <button 
+                  onClick={() => setViewMode('calendar')}
+                  className={cn(
+                    "px-2.5 xl:px-4 py-1.5 rounded-lg text-[10px] xl:text-[11px] font-black uppercase tracking-tighter transition-all whitespace-nowrap",
+                    viewMode === 'calendar' ? "bg-white text-indigo-600 shadow-sm border border-indigo-50" : "text-slate-400 hover:text-slate-600"
+                  )}
+                >
+                  {t('Calendar')}
+                </button>
+                <button 
+                  onClick={() => setViewMode('archive')}
+                  className={cn(
+                    "px-2.5 xl:px-4 py-1.5 rounded-lg text-[10px] xl:text-[11px] font-black uppercase tracking-tighter transition-all whitespace-nowrap",
+                    viewMode === 'archive' ? "bg-white text-indigo-600 shadow-sm border border-indigo-50" : "text-slate-400 hover:text-slate-600"
+                  )}
+                >
+                  {t('Archive')}
+                </button>
+                <button 
+                  onClick={() => setViewMode('trash')}
+                  className={cn(
+                    "px-2.5 xl:px-4 py-1.5 rounded-lg text-[10px] xl:text-[11px] font-black uppercase tracking-tighter transition-all whitespace-nowrap",
+                    viewMode === 'trash' ? "bg-white text-red-500 shadow-sm border border-red-50" : "text-slate-400 hover:text-slate-600"
+                  )}
+                >
+                  {t('Trash')}
+                </button>
+                <button 
+                  onClick={() => setViewMode('settings')}
+                  className={cn(
+                    "px-2.5 xl:px-4 py-1.5 rounded-lg text-[10px] xl:text-[11px] font-black uppercase tracking-tighter transition-all whitespace-nowrap",
+                    viewMode === 'settings' ? "bg-white text-indigo-600 shadow-sm border border-indigo-50" : "text-slate-400 hover:text-slate-600"
+                  )}
+                >
+                  {t('Settings')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsUserGuideOpen(true)}
+                  className="px-2 xl:px-3 py-1.5 rounded-lg text-[10px] xl:text-[11px] font-black uppercase tracking-tighter transition-all text-indigo-600 hover:bg-indigo-50 flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                  title={L('使い方ガイド (README.md) を表示', 'Open User Guide (README.md)', "Ouvrir le guide d'utilisation (README.md)")}
+                >
+                  <BookOpen size={13} className="shrink-0" />
+                  <span>{L('使い方', 'Guide', 'Guide')}</span>
+                </button>
+              </nav>
+
+              <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+                {/* Undo/Redo */}
+                <div className="flex bg-slate-50 border border-slate-100 rounded-lg sm:rounded-xl p-0.5 shrink-0">
+                  <button 
+                    onClick={undo}
+                    disabled={history.length === 0 || isUndoing}
+                    className={cn(
+                      "p-1 sm:p-1.5 rounded-md sm:rounded-lg transition-all",
+                      history.length > 0 ? "text-indigo-600 hover:bg-white hover:shadow-sm" : "text-slate-300 cursor-not-allowed"
+                    )}
+                    title="Undo"
+                  >
+                    <Undo2 size={13} className={cn(isUndoing && "animate-spin")} />
+                  </button>
+                  <button 
+                    onClick={redo}
+                    disabled={redoStack.length === 0 || isUndoing}
+                    className={cn(
+                      "p-1 sm:p-1.5 rounded-md sm:rounded-lg transition-all",
+                      redoStack.length > 0 ? "text-indigo-600 hover:bg-white hover:shadow-sm" : "text-slate-300 cursor-not-allowed"
+                    )}
+                    title="Redo"
+                  >
+                    <Redo2 size={13} />
+                  </button>
+                </div>
+
+                {/* Display Mode Toggle (Mobile only) */}
+                <button 
+                  onClick={() => {
+                    const next: 'compact' | 'standard' | 'large' = 
+                      settings.displayMode === 'standard' ? 'large' : 
+                      settings.displayMode === 'large' ? 'compact' : 'standard';
+                    saveSettings({ displayMode: next });
+                  }}
+                  className="md:hidden w-7 h-7 sm:w-8 sm:h-8 rounded-lg sm:rounded-xl flex items-center justify-center bg-white border border-slate-200 text-slate-400 shadow-sm shrink-0"
+                  title={L('表示モード切替', 'Toggle View Mode', 'Changer le mode d\'affichage')}
+                >
+                  {settings.displayMode === 'compact' ? <LayoutList size={14} /> : 
+                   settings.displayMode === 'large' ? <Grid2X2 size={14} /> : <LayoutGrid size={14} />}
+                </button>
+
+                {/* User Guide Button (Icon-only on Mobile & Tablet < lg) */}
+                <button
+                  type="button"
+                  onClick={() => setIsUserGuideOpen(true)}
+                  className="lg:hidden w-7 h-7 sm:w-8 sm:h-8 rounded-lg sm:rounded-xl flex items-center justify-center bg-indigo-50 border border-indigo-200 text-indigo-700 shadow-sm cursor-pointer shrink-0"
+                  title={L('使い方ガイド (README.md)', 'User Guide (README.md)', "Guide d'utilisation")}
+                >
+                  <BookOpen size={13} className="text-indigo-600 shrink-0" />
+                </button>
+
+                {/* Sync Status / Local Setting Button (Icon-only on Mobile & Tablet, Icon+Text on xl Desktop) */}
+                <div className="relative shrink-0">
+                  {!isLocalLogConfigured ? (
+                    <button
+                      onClick={jumpToLocalLogSettings}
+                      className="w-7 h-7 sm:w-8 sm:h-8 xl:w-auto xl:h-auto xl:px-3 xl:py-1.5 rounded-lg sm:rounded-xl border bg-amber-50/90 border-amber-200 hover:bg-amber-100/80 text-amber-700 transition-all shadow-sm cursor-pointer flex items-center justify-center gap-1.5"
+                      title={L(
+                        'ローカルログ設定が未完了です。クリックして設定画面へ移動します',
+                        'Local log is not configured. Click to open Local Log Settings',
+                        'Le journal local n\'est pas configuré. Cliquez pour ouvrir les paramètres'
+                      )}
+                    >
+                      <SettingsIcon size={13} className="text-amber-600 shrink-0" />
+                      <span className="hidden xl:inline text-[10px] font-bold uppercase tracking-tighter whitespace-nowrap">
+                        {L('ローカル設定が必要', 'Local Setting Needed', 'Config. locale requise')}
+                      </span>
+                    </button>
+                  ) : !isLocalDiskReady ? (
+                    <button
+                      onClick={() => {
+                        if (dirHandle && dirPermission !== 'granted') {
+                          authorizeLocalFolderNow();
+                        } else {
+                          setShowSyncDetails(!showSyncDetails);
+                        }
+                      }}
+                      className="w-7 h-7 sm:w-8 sm:h-8 xl:w-auto xl:h-auto xl:px-3 xl:py-1.5 rounded-lg sm:rounded-xl border bg-amber-50/90 border-amber-200 hover:bg-amber-100/80 text-amber-700 transition-all shadow-sm cursor-pointer flex items-center justify-center gap-1.5"
+                      title={
+                        dirHandle
+                          ? L(
+                              'クリックしてローカルフォルダへの上書き保存を許可します',
+                              'Click to authorize writing to your local folder',
+                              'Cliquez pour autoriser l\'écriture dans le dossier local'
+                            )
+                          : L(
+                              'PCの保存先フォルダを選択してください',
+                              'Please select your local backup folder',
+                              'Veuillez sélectionner votre dossier local'
+                            )
+                      }
+                    >
+                      <RefreshCcw size={13} className={cn("text-amber-600 shrink-0", isSyncing && "animate-spin")} />
+                      <span className="hidden xl:inline text-[10px] font-bold uppercase tracking-tighter whitespace-nowrap">
+                        {dirHandle
+                          ? L('上書き許可が必要', 'Allow Local Write', 'Autoriser écriture')
+                          : L('フォルダ未接続', 'Connect Folder', 'Connecter dossier')}
+                      </span>
+                    </button>
+                  ) : (
+                    <button 
+                      onClick={() => setShowSyncDetails(!showSyncDetails)}
+                      className="w-7 h-7 sm:w-8 sm:h-8 xl:w-auto xl:h-auto xl:px-3 xl:py-1.5 rounded-lg sm:rounded-xl border bg-emerald-50 border-emerald-200 hover:bg-emerald-100/70 transition-all cursor-pointer flex items-center justify-center gap-1.5 shadow-2xs"
+                      title={L(
+                        'ローカルログ同期が有効です（1日ごとに3ファイルでローテーション・同日の変更は同じファイルに上書き保存）',
+                        'Local log sync is active (daily rotation across 3 files; same-day changes overwrite today\'s file)',
+                        'La synchro locale est active (rotation quotidienne sur 3 fichiers)'
+                      )}
+                    >
+                      <Globe size={13} className="text-emerald-600 shrink-0" />
+                      <span className="hidden xl:inline text-[10px] font-bold uppercase tracking-tighter text-emerald-700 whitespace-nowrap">
+                        {t('SyncActive')}
+                      </span>
+                    </button>
+                  )}
+                  
+                  {showSyncDetails && isLocalLogConfigured && (
+                    <>
+                      <div className="fixed inset-0 z-[55]" onClick={() => setShowSyncDetails(false)} />
+                      <div className="absolute top-full right-0 mt-2 w-80 max-w-[calc(100vw-1.5rem)] bg-white border border-slate-200 rounded-2xl shadow-2xl z-[60] p-4">
+                        <div className="flex items-center justify-between mb-3 pb-2 border-b border-slate-100">
+                          <div className="flex items-center gap-2 text-slate-800">
+                            <Activity size={13} className={isLocalDiskReady ? "text-emerald-500" : "text-amber-500"} />
+                            <p className="text-[10px] font-black uppercase tracking-widest">{t('AutomatedSyncStatus')}</p>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <button 
+                              onClick={(e) => { e.stopPropagation(); authorizeLocalFolderNow(); }}
+                              className="p-1.5 hover:bg-indigo-50 rounded-lg transition-colors text-indigo-600 flex items-center gap-1 text-[9px] font-bold"
+                              title={t('ForceBackupNow')}
+                              disabled={isSyncing}
+                            >
+                              <RefreshCcw size={12} className={cn(isSyncing && "animate-spin")} />
+                              <span>{L('今すぐ更新', 'Sync Now', 'Synchroniser')}</span>
+                            </button>
+                          </div>
+                        </div>
+                        <div className="space-y-3">
+                          <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-100">
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="text-[8px] font-black text-slate-400 uppercase">{t('LocalDirectoryPath')}</label>
+                              <span className={cn(
+                                "text-[8px] font-black uppercase px-1.5 py-0.5 rounded",
+                                isLocalDiskReady
+                                  ? "bg-emerald-100 text-emerald-700"
+                                  : "bg-amber-100 text-amber-700"
+                              )}>
+                                {isLocalDiskReady
+                                  ? t('SyncActive')
+                                  : dirHandle
+                                  ? L('要書き込み許可', 'Permission Needed', 'Autorisation requise')
+                                  : L('フォルダ未接続', 'Folder Disconnected', 'Dossier non lié')}
+                              </span>
+                            </div>
+                            <p className="text-[10px] font-mono break-all text-slate-700 leading-tight">
+                              {dirHandle?.name || settings.localBackupPath || t('AuthorizedLocalFolder')}
+                            </p>
+                            {!isLocalDiskReady && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  authorizeLocalFolderNow();
+                                }}
+                                className="mt-2 w-full py-1.5 px-2 bg-amber-500 hover:bg-amber-600 text-white rounded text-[9px] font-bold transition-colors cursor-pointer"
+                              >
+                                {!dirHandle
+                                  ? L('保存先フォルダを選択して自動上書きを有効化', 'Select Folder to Enable Direct Overwrite', 'Sélectionner le dossier')
+                                  : L('クリックしてローカルファイル上書き保存を許可', 'Click to Authorize Local File Overwrite', 'Autoriser l\'écriture locale')}
+                              </button>
+                            )}
+                          </div>
+
+                          {/* 3-File Daily Rotating Backup List (1, 2, 3) */}
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[9px] font-black text-slate-500 uppercase tracking-wider">
+                                {L('日次ローテーション (最大3ファイル)', 'Daily Rotation (Max 3 Files)', 'Rotation quotidienne (Max 3)')}
+                              </span>
+                              <span className="text-[8px] font-mono text-indigo-600 font-bold">
+                                {L(`本日: #${nextBackupSlot}`, `Today: #${nextBackupSlot}`, `Aujourd'hui : #${nextBackupSlot}`)}
+                              </span>
+                            </div>
+                            <div className="space-y-1">
+                              {([1, 2, 3] as const).map((slotNum) => {
+                                const info = backupSlots[slotNum];
+                                const userPart = user?.email?.split('@')[0] || 'local';
+                                const defaultName = `NavFOR_Log_${userPart}_${slotNum}.csv`;
+                                return (
+                                  <div
+                                    key={slotNum}
+                                    className="flex items-center justify-between bg-slate-50/80 border border-slate-100 rounded-lg px-2.5 py-1.5 text-[10px]"
+                                  >
+                                    <div className="min-w-0 flex-1 pr-2">
+                                      <div className="flex items-center gap-1.5">
+                                        <span className={cn(
+                                          "w-4 h-4 rounded text-[9px] font-black flex items-center justify-center shrink-0",
+                                          info ? "bg-indigo-100 text-indigo-700" : "bg-slate-200 text-slate-500"
+                                        )}>
+                                          {slotNum}
+                                        </span>
+                                        <span className="font-mono font-bold text-slate-700 truncate">
+                                          {info?.fileName || defaultName}
+                                        </span>
+                                      </div>
+                                      <p className="text-[8px] text-slate-400 pl-5 mt-0.5">
+                                        {info
+                                          ? `${format(info.timestamp, 'MM/dd HH:mm:ss')} (${info.taskCount} ${t('Items')})`
+                                          : L('未作成', 'Empty slot', 'Vide')}
+                                      </p>
+                                    </div>
+                                    {info && (
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          downloadBackupSlot(slotNum);
+                                        }}
+                                        className="p-1 hover:bg-white rounded border border-transparent hover:border-slate-200 text-slate-500 hover:text-indigo-600 transition-colors shrink-0"
+                                        title={L(`#${slotNum} をダウンロード`, `Download #${slotNum}`, `Télécharger #${slotNum}`)}
+                                      >
+                                        <Download size={11} />
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          <div className="flex justify-between items-center text-[10px] font-bold text-slate-500 pt-1 border-t border-slate-100">
+                            <span>{t('LastSuccessfulLog')}:</span>
+                            <span className="text-slate-900 font-mono">
+                              {lastSyncTime ? format(lastSyncTime, 'MM/dd HH:mm:ss') : L('待機中...', 'Waiting...', 'En attente...')}
+                            </span>
+                          </div>
+
+                          <button
+                            onClick={jumpToLocalLogSettings}
+                            className="w-full py-1.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[10px] font-bold transition-colors flex items-center justify-center gap-1.5"
+                          >
+                            <SettingsIcon size={11} />
+                            {L('ローカルログ設定を開く', 'Open Local Log Settings', 'Ouvrir les paramètres locaux')}
+                          </button>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* User Profile / LogOut (Icon-only on Mobile & Tablet, text shown only on xl Desktop) */}
+          <div className="flex items-center gap-1 sm:gap-1.5 xl:gap-2 border-l border-slate-100 pl-1.5 sm:pl-2.5 xl:pl-4 ml-0.5 sm:ml-1 shrink-0">
+            {user ? (
+              <>
+                <div className="text-right flex-col items-end leading-none hidden xl:flex">
+                  <span className="text-[9px] font-black uppercase tracking-[0.2em] text-indigo-500/50 mb-0.5">
+                    {user.isAnonymous ? L('ゲスト (匿名)', 'Guest (Anonymous)', 'Invité (Anonyme)') : t('Authenticated')}
+                  </span>
+                  <span className="text-xs font-bold text-slate-700 max-w-[120px] truncate">
+                    {user.displayName || user.email?.split('@')[0] || L('ゲスト', 'Guest', 'Invité')}
+                  </span>
+                </div>
+                <div
+                  className="w-7 h-7 sm:w-8 sm:h-8 xl:w-9 xl:h-9 rounded-lg sm:rounded-xl overflow-hidden border-2 border-white shadow-xl shadow-indigo-100/50 bg-indigo-50 flex items-center justify-center text-indigo-400 shrink-0"
+                  title={user.displayName || user.email || L('ゲスト', 'Guest', 'Invité')}
+                >
+                  {user.photoURL ? (
+                    <img src={user.photoURL} alt="Profile" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                  ) : (
+                    <UserIcon size={15} />
+                  )}
+                </div>
+                <button 
+                  onClick={logOut}
+                  className="w-7 h-7 sm:w-8 sm:h-8 xl:w-9 xl:h-9 rounded-lg sm:rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-center text-slate-400 hover:text-red-500 hover:border-red-100 hover:bg-red-50 transition-all group shrink-0"
+                  title={t('LogOut')}
+                >
+                  <LogOut size={14} />
+                </button>
+              </>
+            ) : (
+              <div className="flex items-center gap-1.5 sm:gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsUserGuideOpen(true)}
+                  className="flex items-center gap-1 sm:gap-1.5 px-2.5 sm:px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-xl text-[11px] sm:text-xs font-bold transition-all cursor-pointer"
+                  title={L("使い方ガイド (README.md)", "User Guide (README.md)", "Guide d'utilisation")}
+                >
+                  <BookOpen size={14} className="text-indigo-600 shrink-0" />
+                  <span>{L("使い方", "Guide", "Guide")}</span>
+                </button>
+                <button 
+                  onClick={() => setIsAuthModalOpen(true)}
+                  className="flex items-center gap-1 sm:gap-1.5 px-2.5 sm:px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-[11px] sm:text-xs font-bold transition-all cursor-pointer"
+                  title={L("設定診断 & トラブルシューティング", "Diagnostics & Troubleshooting", "Diagnostic & Dépannage")}
+                >
+                  <ShieldAlert size={14} className="text-indigo-600 shrink-0" />
+                  <span className="hidden sm:inline">{L("設定診断", "Diagnostics", "Diagnostic")}</span>
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      {!user ? (
+        <main className="flex-1 min-h-0 overflow-y-auto relative bg-[#f8fafc]">
+          <SignInView
+            onSuccess={() => {
+              setMessage({ text: L("サインインしました。アカウントデータを読み込んでいます...", "Signed in. Loading your account data...", "Connecté. Chargement des données du compte..."), type: 'info' });
+            }}
+            onOpenDiagnostics={() => setIsAuthModalOpen(true)}
+            version={APP_VERSION}
+            language={settings.language}
+            onChangeLanguage={(lang) => saveSettings({ language: lang })}
+          />
+        </main>
+      ) : (
+        <main className={cn(
+          "flex-1 min-h-0 overflow-hidden relative",
+          isEffectiveTimelineFullscreen
+            ? "p-0 flex flex-col lg:flex-row gap-0"
+            : (viewMode === 'dashboard' || viewMode === 'archive' || viewMode === 'trash')
+              ? "p-2 md:p-3 flex flex-col lg:flex-row gap-3"
+              : "p-4 md:p-6 grid grid-cols-12 gap-6"
+        )}>
+        {/* Mobile Navigation (Bottom) */}
+        <div className={cn(
+          "lg:hidden fixed bottom-0 left-0 right-0 h-16 bg-white border-t border-slate-200 z-[70] flex items-center justify-around px-2 shadow-[0_-4px_20px_rgba(0,0,0,0.1)]",
+          isEffectiveTimelineFullscreen && "hidden"
+        )}>
+          <button 
+            onClick={() => { setViewMode('dashboard'); setMobileView('summary'); }}
+            className={cn("flex flex-col items-center gap-1 transition-colors", viewMode === 'dashboard' && mobileView === 'summary' ? "text-indigo-600" : "text-slate-400")}
+          >
+            <Layers size={20} />
+            <span className="text-[9px] font-bold uppercase tracking-tighter">{L('ツリー', 'Tree', 'Arbre')}</span>
+          </button>
+          <button 
+            onClick={() => { setViewMode('dashboard'); setMobileView('focus'); }}
+            className={cn("flex flex-col items-center gap-1 transition-colors", viewMode === 'dashboard' && mobileView === 'focus' ? "text-indigo-600" : "text-slate-400")}
+          >
+            <CalendarDays size={20} />
+            <span className="text-[9px] font-bold uppercase tracking-tighter">{L('タイムライン', 'Timeline', 'Chrono')}</span>
+          </button>
+          <button 
+            onClick={() => { setViewMode('calendar'); setMobileView('calendar'); }}
+            className={cn("flex flex-col items-center gap-1 transition-colors", viewMode === 'calendar' ? "text-indigo-600" : "text-slate-400")}
+          >
+            <Calendar size={20} />
+            <span className="text-[9px] font-bold uppercase tracking-tighter">{t('Calendar')}</span>
+          </button>
+          <button 
+            onClick={() => { setViewMode('archive'); setMobileView('archive'); }}
+            className={cn("flex flex-col items-center gap-1 transition-colors", viewMode === 'archive' ? "text-indigo-600" : "text-slate-400")}
+          >
+            <ArchiveIcon size={20} />
+            <span className="text-[9px] font-bold uppercase tracking-tighter">{t('Archive')}</span>
+          </button>
+          <button 
+            onClick={() => { setViewMode('trash'); setMobileView('trash'); }}
+            className={cn("flex flex-col items-center gap-1 transition-colors", viewMode === 'trash' ? "text-red-500" : "text-slate-400")}
+          >
+            <Trash2 size={20} />
+            <span className="text-[9px] font-bold uppercase tracking-tighter">{t('Trash')}</span>
+          </button>
+          <button 
+            onClick={() => { setViewMode('settings'); setMobileView('settings'); }}
+            className={cn("flex flex-col items-center gap-1 transition-colors", viewMode === 'settings' ? "text-indigo-600" : "text-slate-400")}
+          >
+            <SettingsIcon size={20} />
+            <span className="text-[9px] font-bold uppercase tracking-tighter">{t('Settings')}</span>
+          </button>
+        </div>
+
+        {/* VS Code-Style Explorer Tree */}
+        {viewMode === 'dashboard' && !isEffectiveTimelineFullscreen && (
+          isExplorerCollapsed ? (
+            <div className={cn(
+              "h-full shrink-0 flex flex-col items-center py-2 px-1 bg-slate-50/90 border-r border-slate-200 select-none w-10 transition-all",
+              mobileView !== 'summary' && "hidden lg:flex"
+            )}>
+              <button
+                onClick={handleToggleExplorerCollapse}
+                className="p-1.5 hover:bg-slate-200 text-slate-600 hover:text-indigo-600 rounded-md transition-colors"
+                title={L('Explorerを展開 (タイムラインを縮小)', 'Expand Explorer', "Développer l'explorateur")}
+              >
+                <Layers size={16} />
+              </button>
+              <div 
+                onClick={handleToggleExplorerCollapse}
+                className="mt-6 flex-1 cursor-pointer flex flex-col items-center justify-start text-slate-400 hover:text-slate-700 transition-colors w-full"
+                title={L('Explorerを展開', 'Expand Explorer', "Développer l'explorateur")}
+              >
+                <span className="text-[10px] font-black tracking-widest uppercase [writing-mode:vertical-lr] rotate-180 select-none">
+                  Explorer
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className={cn(
+              "h-full min-h-0 w-full lg:w-auto shrink-0",
+              mobileView !== 'summary' && "hidden lg:flex"
+            )}>
+              <TaskExplorerTree
+                tasks={filteredTasks}
+                activeTaskId={activeTabTaskId}
+                openTaskIds={openTaskIds}
+                onSelectTask={handleOpenTaskInTab}
+                onAddTask={handleCreateTaskDirect}
+                onToggleDone={toggleDone}
+                onToggleStar={toggleStar}
+                onTogglePin={togglePin}
+                onMoveTask={moveTask}
+                onMoveTaskFolder={(taskId, newProject) => updateTask(taskId, { project: newProject })}
+                onMoveFolder={handleMoveFolder}
+                onRenameFolder={handleRenameFolder}
+                onDeleteFolder={handleDeleteFolder}
+                onDuplicateFolder={handleDuplicateFolder}
+                onRenameTask={(taskId, newTitle) => updateTask(taskId, { title: newTitle })}
+                onDeleteTask={deleteTask}
+                onDuplicateTask={handleDuplicateTask}
+                onToggleCollapse={handleToggleExplorerCollapse}
+                activeSection={activeSection}
+                width={explorerWidth}
+                onWidthChange={handleExplorerWidthChange}
+                urgentLimit={settings.urgentLimit}
+                onOpenDailyPick={() => setIsPickingDaily(true)}
+                deadlineThresholdDays={settings.deadlineThreshold}
+                language={settings.language}
+                folderMetas={folderMetas}
+                onToggleFolderStar={handleToggleFolderStar}
+                onToggleFolderPin={handleToggleFolderPin}
+                t={t}
+              />
+            </div>
+          )
+        )}
+
+        {/* Task Columns / Timeline & Detail Area */}
+        <div className={cn(
+          "h-full min-h-0 overflow-hidden relative",
+          (viewMode === 'dashboard' || viewMode === 'archive' || viewMode === 'trash')
+            ? "flex-1 min-w-0 flex flex-row min-h-0"
+            : "col-span-12"
+        )}>
+          <div className={cn(
+            "flex-1 h-full min-w-0 flex flex-col min-h-0 overflow-hidden",
+            viewMode === 'dashboard' && mobileView === 'summary' && !isEffectiveTimelineFullscreen && "hidden lg:flex"
+          )}>
+            <AnimatePresence mode="wait">
+              <motion.div
+                key={viewMode}
+                initial={{ x: 10, opacity: 0 }}
+                animate={{ x: 0, opacity: 1 }}
+                exit={{ x: -10, opacity: 0 }}
+                transition={{ duration: 0.2 }}
+                className="h-full min-w-0 flex-1 flex flex-col overflow-hidden"
+              >
+                {viewMode === 'dashboard' ? (
+                  /* Project Timeline View */
+                  <div className="flex-1 h-full min-w-0 flex flex-col min-h-0 overflow-hidden">
+                    <ProjectTimelineView
+                      tasks={filteredTasks}
+                      activeTaskId={activeTabTaskId}
+                      onSelectTask={handleOpenTaskInTab}
+                      onUpdateTask={updateTask}
+                      onScheduleTask={(taskId, deadline) => updateTask(taskId, { deadline })}
+                      onRenameFolder={handleRenameFolder}
+                      onDeleteFolder={handleDeleteFolder}
+                      onDuplicateFolder={handleDuplicateFolder}
+                      onRenameTask={(taskId, newTitle) => updateTask(taskId, { title: newTitle })}
+                      onDeleteTask={deleteTask}
+                      onDuplicateTask={handleDuplicateTask}
+                      onMoveTask={moveTask}
+                      onToggleDone={toggleDone}
+                      onToggleStar={toggleStar}
+                      onTogglePin={togglePin}
+                      onMoveTaskFolder={(taskId, newProject) => updateTask(taskId, { project: newProject })}
+                      onMoveFolder={handleMoveFolder}
+                      onAddTask={handleCreateTaskDirect}
+                      activeSection={activeSection}
+                      language={settings.language}
+                      folderMetas={folderMetas}
+                      onToggleFolderStar={handleToggleFolderStar}
+                      onToggleFolderPin={handleToggleFolderPin}
+                      isFullscreen={isEffectiveTimelineFullscreen}
+                      onToggleFullscreen={handleToggleTimelineFullscreen}
+                      t={t}
+                    />
+                  </div>
+                ) : viewMode === 'calendar' ? (
+                  /* Calendar Mode */
+                  <CalendarView 
+                    tasks={searchAndProjectFilteredTasks} 
+                    onEdit={setEditingTask} 
+                    t={t} 
+                    locale={dateLocale}
+                  />
+                ) : viewMode === 'archive' ? (
+                  /* Archive Mode (Explorer Style) */
+                  <section className="flex-1 flex flex-col rounded-2xl border p-4 md:p-6 min-h-0 bg-white border-slate-200 shadow-sm h-full overflow-hidden">
+                    <ArchiveTrashExplorerView
+                      mode="archive"
+                      tasks={filteredTasks.filter(t => t.category === 'Archive')}
+                      activeTaskId={activeTabTaskId}
+                      openTaskIds={openTaskIds}
+                      onRestore={(taskId, cat) => moveTask(taskId, cat || 'Focus')}
+                      onPermanentDelete={(taskId) => deleteTask(taskId)}
+                      onMoveToTrash={(taskId) => moveTask(taskId, 'Trash')}
+                      onSelectTask={handleOpenTaskInTab}
+                      onToggleStar={(taskId) => toggleStar(taskId)}
+                      onTogglePin={(taskId) => togglePin(taskId)}
+                      archiveThresholdDays={settings.archiveThresholdDays}
+                      onCleanupArchive={() => cleanupArchive()}
+                      language={settings.language}
+                      t={t}
+                    />
+                  </section>
+                ) : viewMode === 'trash' ? (
+                  /* Trash Mode (Explorer Style with nearing purge indicators) */
+                  <section className="flex-1 flex flex-col rounded-2xl border p-4 md:p-6 min-h-0 bg-white border-red-200/70 shadow-sm h-full overflow-hidden">
+                    <ArchiveTrashExplorerView
+                      mode="trash"
+                      tasks={filteredTasks.filter(t => t.category === 'Trash')}
+                      activeTaskId={activeTabTaskId}
+                      openTaskIds={openTaskIds}
+                      onRestore={(taskId, cat) => moveTask(taskId, cat || 'Backlog')}
+                      onPermanentDelete={(taskId) => deleteTask(taskId)}
+                      onSelectTask={handleOpenTaskInTab}
+                      trashCleanupThresholdDays={settings.trashCleanupThresholdDays}
+                      onEmptyTrash={() => emptyTrash()}
+                      language={settings.language}
+                      t={t}
+                    />
+                  </section>
+                ) : (
+            /* Settings Mode */
+            <section className="flex flex-col rounded-2xl border p-4 md:p-8 min-h-0 bg-white border-slate-200 h-full overflow-hidden">
+              <div className="max-w-2xl mx-auto w-full flex-1 overflow-y-auto custom-scrollbar pb-32">
+                <div className="flex items-center gap-3 mb-10">
+                  <div className="w-12 h-12 bg-indigo-100 rounded-2xl flex items-center justify-center text-indigo-600">
+                    <SettingsIcon size={28} />
+                  </div>
+                  <div>
+                    <h2 className="text-2xl font-bold tracking-tight text-slate-800">{t('Settings')}</h2>
+                    <p className="text-sm text-slate-500">{t('SelectLanguageDesc')}</p>
+                  </div>
+                </div>
+
+                <div className="space-y-8 md:space-y-12">
+                  {/* User Guide & README.md Documentation */}
+                  <div className="bg-gradient-to-br from-indigo-50/80 via-white to-slate-50 rounded-3xl p-6 md:p-8 border border-indigo-100 shadow-sm space-y-5">
+                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                      <div className="flex items-center gap-2.5 text-indigo-600">
+                        <BookOpen size={20} />
+                        <h3 className="font-bold text-sm uppercase tracking-wider">
+                          {L(
+                            '使い方ガイド & ドキュメント (README.md)',
+                            `User Guide & Documentation (${getReadmeFilenameByLang(settings.language)})`,
+                            `Guide d'utilisation (${getReadmeFilenameByLang(settings.language)})`
+                          )}
+                        </h3>
+                      </div>
+                      <span className="text-[10px] font-mono font-bold text-indigo-600 bg-indigo-50 px-2.5 py-0.5 rounded-full border border-indigo-100">
+                        v{APP_VERSION} Latest
+                      </span>
+                    </div>
+
+                    <p className="text-xs text-slate-600 leading-relaxed">
+                      {L(
+                        'Explorer（フォルダ・サブフォルダ階層管理）、Project Timeline（期間バー・モバイル横画面の全画面表示・レーン幅調整）、Task Detail（マルチタブ・2画面分割）、タスク追加・Focus管理、およびローカル3世代バックアップの詳しい使い方を掲載しています。アプリ内ビューアで読むか、独立したWebページ（HTML）として新しいタブで開くことができます。',
+                        'Learn how to use Explorer, Project Timeline (date/phase bars, mobile landscape fullscreen, resizable lanes), Task Detail (multi-tab & split view), Focus management, and 3-file rolling local backups. Read directly inside the app or open as a standalone HTML web page.',
+                        'Découvrez comment utiliser Explorer, Project Timeline, Task Detail, Focus et la sauvegarde locale rotative. Consultez le guide dans l’application ou ouvrez-le comme page Web HTML.'
+                      )}
+                    </p>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <button
+                        type="button"
+                        onClick={() => setIsUserGuideOpen(true)}
+                        className="py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 shadow-sm cursor-pointer"
+                      >
+                        <BookOpen size={15} />
+                        <span>{L('アプリ内で「使い方」を見る', 'Open User Guide in App', 'Ouvrir le guide dans l’app')}</span>
+                      </button>
+
+                      {standaloneReadmeHtmlUrl && (
+                        <a
+                          href={standaloneReadmeHtmlUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="py-3 px-4 bg-white hover:bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 shadow-sm"
+                        >
+                          <ExternalLink size={15} />
+                          <span>{L('Webページ(HTML)で別タブ表示', 'Open as HTML Web Page', 'Ouvrir en page Web HTML')}</span>
+                        </a>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => downloadReadmeMarkdown(settings.language)}
+                        className="py-3 px-4 bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 shadow-sm cursor-pointer"
+                      >
+                        <Download size={15} />
+                        <span>
+                          {L(
+                            'README.md を保存',
+                            `Download ${getReadmeFilenameByLang(settings.language)}`,
+                            `Télécharger ${getReadmeFilenameByLang(settings.language)}`
+                          )}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+
+                   {/* Data Synchronization & Import */}
+                  <div className="bg-slate-50 rounded-3xl p-6 md:p-8 border border-slate-100 shadow-sm space-y-6">
+                    <div className="flex items-center gap-2 text-indigo-600">
+                      <Download size={20} />
+                      <h3 className="font-bold text-sm uppercase tracking-wider">{t('DataLifecycle')}</h3>
+                    </div>
+                    
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="bg-white p-4 rounded-2xl border border-slate-100">
+                        <p className="text-xs font-bold text-slate-800 mb-1">{t('ExportData')}</p>
+                        <p className="text-[10px] text-slate-400 mb-3 uppercase tracking-tighter">Backup to NavFOR CSV</p>
+                        <button 
+                          onClick={() => {
+                            const userPart = user?.email?.split('@')[0] || 'local';
+                            const blob = new Blob([getCSVData()], { type: 'text/csv' });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.style.display = 'none';
+                            a.href = url;
+                            a.download = `NavFOR_Log_${userPart}_Manual.csv`;
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                            URL.revokeObjectURL(url);
+                          }}
+                          className="w-full py-2.5 bg-slate-800 text-white rounded-xl text-xs font-bold hover:bg-slate-900 transition-all flex items-center justify-center gap-2"
+                        >
+                          <Download size={14} /> Download CSV
+                        </button>
+                      </div>
+
+                      <div className="bg-white p-4 rounded-2xl border border-slate-100">
+                        <p className="text-xs font-bold text-slate-800 mb-1">{t('ImportData')}</p>
+                        <p className="text-[10px] text-slate-400 mb-3 uppercase tracking-tighter">Restore from NavFOR CSV</p>
+                        <label className="flex items-center justify-center gap-2 w-full py-2.5 bg-indigo-50 text-indigo-600 rounded-xl text-xs font-bold hover:bg-indigo-100 transition-all cursor-pointer">
+                          <Upload size={14} /> Import CSV
+                          <input type="file" accept=".csv" className="hidden" onChange={handleCSVImport} />
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Account Information */}
+                  <div className="bg-slate-50 rounded-2xl p-6 border border-slate-100">
+                    <div className="flex items-center gap-2 mb-4 text-slate-600">
+                      <UserIcon size={18} />
+                      <h3 className="font-bold text-sm uppercase tracking-wider">{t('AccountInformation')}</h3>
+                    </div>
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                      <div className="flex items-center gap-4">
+                        <div className="w-12 h-12 rounded-full overflow-hidden border-2 border-white shadow-sm bg-indigo-50 flex items-center justify-center text-indigo-400">
+                          {user?.photoURL ? (
+                            <img src={user.photoURL} alt="Profile" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                          ) : (
+                            <UserIcon size={24} />
+                          )}
+                        </div>
+                        <div>
+                          <p className="font-bold text-slate-900 truncate max-w-[200px]">{user?.displayName || t('PersonalAccount')}</p>
+                          <p className="text-[10px] text-slate-500 truncate max-w-[200px]">{user?.email || t('NotSignedIn')}</p>
+                        </div>
+                      </div>
+                      <div className="flex flex-col md:items-end gap-1">
+                        <span className={cn(
+                          "text-[9px] font-black uppercase tracking-widest px-2 py-0.5 rounded border self-start md:self-auto",
+                          user ? "bg-emerald-50 text-emerald-600 border-emerald-100" : "bg-slate-100 text-slate-400 border-slate-200"
+                        )}>
+                          {user ? t('CloudSynced') : t('LocalOnly')}
+                        </span>
+                        {user && (
+                          <button 
+                            onClick={logOut}
+                            className="text-[10px] font-bold text-red-500 hover:underline flex items-center gap-1"
+                          >
+                            <LogOut size={10} /> {t('DisconnectAccount')}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Language Settings */}
+                  <div className="bg-slate-50 rounded-2xl p-6 border border-slate-100 space-y-4">
+                    <div className="flex items-center gap-2 text-indigo-600">
+                      <Languages size={18} />
+                      <h3 className="font-bold text-sm uppercase tracking-wider">{t('Language')}</h3>
+                    </div>
+                    <div className="flex flex-col gap-6">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div className="flex-1">
+                          <p className="font-bold text-slate-900">{t('Language')}</p>
+                          <p className="text-xs text-slate-500">{t('SelectLanguageDesc')}</p>
+                        </div>
+                        <div className="flex bg-white border border-slate-200 rounded-xl p-1 overflow-hidden shadow-sm w-full sm:w-80 shrink-0 h-11">
+                          <button 
+                            onClick={() => saveSettings({ ...settings, language: 'en' })}
+                            className={cn(
+                              "flex-1 py-1 rounded-lg text-[10px] font-bold transition-all",
+                              settings.language === 'en' ? "bg-indigo-600 text-white shadow-mdScale" : "text-slate-400 hover:text-indigo-600"
+                            )}
+                          >
+                            {t('English')}
+                          </button>
+                          <button 
+                            onClick={() => saveSettings({ ...settings, language: 'ja' })}
+                            className={cn(
+                              "flex-1 py-1 rounded-lg text-[10px] font-bold transition-all",
+                              settings.language === 'ja' ? "bg-indigo-600 text-white shadow-mdScale" : "text-slate-400 hover:text-indigo-600"
+                            )}
+                          >
+                            {t('Japanese')}
+                          </button>
+                          <button 
+                            onClick={() => saveSettings({ ...settings, language: 'fr' })}
+                            className={cn(
+                              "flex-1 py-1 rounded-lg text-[10px] font-bold transition-all",
+                              settings.language === 'fr' ? "bg-indigo-600 text-white shadow-mdScale" : "text-slate-400 hover:text-indigo-600"
+                            )}
+                          >
+                            {t('French')}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Urgent Limits */}
+                  <div className="bg-slate-50 rounded-2xl p-6 border border-slate-100 space-y-4">
+                    <div className="flex items-center gap-2 text-amber-600">
+                      <Zap size={18} />
+                      <h3 className="font-bold text-sm uppercase tracking-wider">{t('UrgentCapacity')}</h3>
+                    </div>
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                      <div className="flex-1">
+                        <p className="font-bold text-slate-900">{t('UrgentSlotLimit')}</p>
+                        <p className="text-xs text-slate-500">
+                          {t('MaxConcurrentUrgent')} <span className="font-semibold text-slate-400">(3 {t('Slots')} ({t('Default')}))</span>
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-3 w-full sm:w-48 shrink-0">
+                        <button 
+                          onClick={() => saveSettings({ ...settings, urgentLimit: Math.max(1, settings.urgentLimit - 1) })}
+                          className="flex-1 h-11 flex items-center justify-center bg-white border border-slate-200 rounded-xl hover:bg-slate-100 transition-colors font-bold shadow-sm"
+                        >-</button>
+                        <div className="w-16 flex flex-col items-center justify-center">
+                          <span className="text-center font-mono font-bold text-xl leading-none">{settings.urgentLimit}</span>
+                          {settings.urgentLimit === 3 && (
+                            <span className="text-[9px] font-bold text-slate-400 leading-tight mt-0.5">({t('Default')})</span>
+                          )}
+                        </div>
+                        <button 
+                          onClick={() => saveSettings({ ...settings, urgentLimit: settings.urgentLimit + 1 })}
+                          className="flex-1 h-11 flex items-center justify-center bg-white border border-slate-200 rounded-xl hover:bg-slate-100 transition-colors font-bold shadow-sm"
+                        >+</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Done Cleanup */}
+                  <div className="bg-slate-50 rounded-2xl p-6 border border-slate-100">
+                    <div className="flex items-center gap-2 mb-4 text-emerald-600">
+                      <RefreshCcw size={18} />
+                      <h3 className="font-bold text-sm uppercase tracking-wider">{t('DoneTrashLifecycle')}</h3>
+                    </div>
+                    <div className="space-y-6">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div className="flex-1">
+                          <p className="font-bold text-slate-900">{t('DoneToTrash')}</p>
+                          <p className="text-xs text-slate-500">{t('DoneToTrashDesc')}</p>
+                        </div>
+                        <select 
+                          className="bg-white border border-slate-200 rounded-lg px-4 py-2 text-sm font-bold outline-none focus:ring-2 focus:ring-emerald-500 transition-all shadow-sm w-full sm:w-56 shrink-0 h-11"
+                          value={settings.doneToTrashThresholdDays}
+                          onChange={(e) => saveSettings({ doneToTrashThresholdDays: parseInt(e.target.value) })}
+                        >
+                          <option value={1}>1 {t('Days')}</option>
+                          <option value={3}>3 {t('Days')}</option>
+                          <option value={7}>7 {t('Days')} ({t('Default')})</option>
+                          <option value={14}>14 {t('Days')}</option>
+                          <option value={99999}>{t('Reset')}</option>
+                        </select>
+                      </div>
+
+                      <div className="pt-6 border-t border-slate-200/60 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div className="flex-1">
+                          <p className="font-bold text-slate-900">{t('TrashAutoCleanup')}</p>
+                          <p className="text-xs text-slate-500">{t('TrashAutoCleanupDesc')}</p>
+                        </div>
+                        <select 
+                          className="bg-white border border-slate-200 rounded-lg px-4 py-2 text-sm font-bold outline-none focus:ring-2 focus:ring-emerald-500 transition-all shadow-sm w-full sm:w-56 shrink-0 h-11"
+                          value={settings.trashCleanupThresholdDays}
+                          onChange={(e) => saveSettings({ trashCleanupThresholdDays: parseInt(e.target.value) })}
+                        >
+                          <option value={7}>7 {t('Days')}</option>
+                          <option value={14}>14 {t('Days')}</option>
+                          <option value={30}>30 {t('Days')} ({t('Default')})</option>
+                          <option value={90}>90 {t('Days')}</option>
+                          <option value={99999}>{t('NeverCleanup')}</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Maintenance */}
+                  <div className="bg-slate-50 rounded-2xl p-6 border border-slate-100">
+                    <div className="flex items-center gap-2 mb-4 text-slate-600">
+                      <ArchiveIcon size={18} />
+                      <h3 className="font-bold text-sm uppercase tracking-wider">{t('AutoArchiveSweep')}</h3>
+                    </div>
+                    <div className="space-y-6">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div className="flex-1">
+                          <p className="font-bold text-slate-900">{t('ArchiveThreshold')}</p>
+                          <p className="text-xs text-slate-500">{t('ArchiveThresholdDesc')}</p>
+                        </div>
+                        <select 
+                          className="bg-white border border-slate-200 rounded-lg px-4 py-2 text-sm font-bold outline-none focus:ring-2 focus:ring-indigo-500 transition-all shadow-sm w-full sm:w-56 shrink-0 h-11"
+                          value={settings.archiveThresholdDays}
+                          onChange={(e) => saveSettings({ archiveThresholdDays: parseInt(e.target.value) })}
+                        >
+                          <option value={7}>7 {t('Days')}</option>
+                          <option value={14}>14 {t('Days')}</option>
+                          <option value={30}>30 {t('Days')}</option>
+                          <option value={90}>90 {t('Days')} ({t('Default')})</option>
+                          <option value={99999}>{t('Never')}</option>
+                        </select>
+                      </div>
+
+                      <div className="pt-6 border-t border-slate-200/60 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div className="flex-1">
+                          <p className="font-bold text-slate-900">{t('ArchiveDoneToTrash')}</p>
+                          <p className="text-xs text-slate-500">{t('ArchiveDoneToTrashDesc')}</p>
+                        </div>
+                        <select 
+                          className="bg-white border border-slate-200 rounded-lg px-4 py-2 text-sm font-bold outline-none focus:ring-2 focus:ring-indigo-500 transition-all shadow-sm w-full sm:w-56 shrink-0 h-11"
+                          value={settings.archiveDoneToTrashDays !== undefined ? settings.archiveDoneToTrashDays : 7}
+                          onChange={(e) => saveSettings({ archiveDoneToTrashDays: parseInt(e.target.value) })}
+                        >
+                          <option value={1}>1 {t('Days')}</option>
+                          <option value={3}>3 {t('Days')}</option>
+                          <option value={7}>7 {t('Days')} ({t('Default')})</option>
+                          <option value={14}>14 {t('Days')}</option>
+                          <option value={30}>30 {t('Days')}</option>
+                          <option value={99999}>{t('Never')}</option>
+                        </select>
+                      </div>
+
+                      <div className="pt-6 border-t border-slate-200/60 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div className="flex-1">
+                          <p className="font-bold text-slate-900">{t('ArchiveInactiveToTrash')}</p>
+                          <p className="text-xs text-slate-500">{t('ArchiveInactiveToTrashDesc')}</p>
+                        </div>
+                        <select 
+                          className="bg-white border border-slate-200 rounded-lg px-4 py-2 text-sm font-bold outline-none focus:ring-2 focus:ring-indigo-500 transition-all shadow-sm w-full sm:w-56 shrink-0 h-11"
+                          value={settings.archiveInactiveToTrashDays !== undefined ? settings.archiveInactiveToTrashDays : 99999}
+                          onChange={(e) => saveSettings({ archiveInactiveToTrashDays: parseInt(e.target.value) })}
+                        >
+                          <option value={7}>7 {t('Days')}</option>
+                          <option value={14}>14 {t('Days')}</option>
+                          <option value={30}>30 {t('Days')}</option>
+                          <option value={90}>90 {t('Days')} (3 {t('month')})</option>
+                          <option value={180}>180 {t('Days')}</option>
+                          <option value={365}>365 {t('Days')}</option>
+                          <option value={99999}>{t('Never')} ({t('Default')})</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Data Management */}
+                  <div className="bg-slate-50 rounded-2xl p-6 border border-slate-100">
+                    <div className="flex items-center gap-2 mb-6 text-emerald-600">
+                      <Download size={18} />
+                      <h3 className="font-bold text-sm uppercase tracking-wider">{t('SyncAndBackup')}</h3>
+                    </div>
+                    
+                    <div className="space-y-6">
+                      {/* Cloud Sync */}
+                      <div className="pb-6 border-b border-slate-200">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
+                          <div className="flex-1">
+                            <p className="font-bold text-slate-900">{t('SyncToCloud')}</p>
+                            <p className="text-xs text-slate-500">{t('SyncToCloudDesc')}</p>
+                          </div>
+                          {!user ? (
+                            <button 
+                              onClick={() => handleSignIn()}
+                              className="bg-white border border-slate-200 text-slate-600 px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 hover:bg-slate-50 transition-all shadow-sm w-full sm:w-auto justify-center h-11"
+                            >
+                              <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-4 h-4" alt="" />
+                              {t('ContinueWithGoogle')}
+                            </button>
+                          ) : (
+                            <div className="flex items-center gap-3 bg-emerald-50 px-3 py-2 rounded-lg border border-emerald-100 w-full sm:w-auto justify-center sm:justify-start h-11">
+                              <div className="w-8 h-8 rounded-full overflow-hidden border border-white shadow-sm flex-shrink-0">
+                                {user.photoURL ? <img src={user.photoURL} alt="" /> : <UserIcon size={14} className="m-2" />}
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <p className="text-[10px] font-bold text-emerald-800 truncate">{user.displayName || user.email}</p>
+                                <p className="text-[8px] font-bold text-emerald-600 uppercase tracking-widest">{t('CloudSynced')}</p>
+                              </div>
+                              <button onClick={logOut} className="text-xs font-bold text-emerald-800/40 hover:text-emerald-800 ml-2">&times;</button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Local Backup */}
+                      <div
+                        id="local-log-settings"
+                        ref={localLogSettingsRef}
+                        className={cn(
+                          "pb-6 border-b border-slate-200 rounded-2xl transition-all duration-500",
+                          highlightLocalSettings && "ring-2 ring-indigo-500 bg-indigo-50/30 p-4 -mx-4"
+                        )}
+                      >
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
+                          <div className="flex-1">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <p className="font-bold text-slate-900">{t('LocalFolderLog')}</p>
+                              <span className={cn(
+                                "text-[9px] font-black uppercase px-2 py-0.5 rounded-full border",
+                                isLocalDiskReady
+                                  ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                                  : "bg-amber-50 text-amber-700 border-amber-200"
+                              )}>
+                                {isLocalDiskReady
+                                  ? t('SyncActive')
+                                  : !isLocalLogConfigured
+                                  ? L('ローカル設定が必要', 'Local Setting Needed', 'Config. locale requise')
+                                  : dirHandle
+                                  ? L('要書き込み許可 (クリックで再開)', 'Write Permission Needed', 'Autorisation requise')
+                                  : L('保存先フォルダ未接続', 'Folder Not Connected', 'Dossier non connecté')}
+                              </span>
+                            </div>
+                            <p className="text-xs text-slate-500 mt-0.5">
+                              {L(
+                                '1日ごとにファイルを分け、その日の変更は同じCSVファイルに上書き保存、次の日は次の通し番号（1 → 2 → 3 → 1 の3ファイル）へローテーションして保存します。',
+                                'Splits backup logs by day across 3 rotating CSV files (1 → 2 → 3 → 1): all changes on the same day overwrite today\'s file, and the next day saves to the next number.',
+                                'Sépare les journaux de sauvegarde par jour en rotation sur 3 fichiers CSV (1 → 2 → 3 → 1) : les modifications du même jour écrasent le même fichier, et le lendemain passe au numéro suivant.'
+                              )}
+                            </p>
+                          </div>
+                          <button 
+                            onClick={async () => {
+                              const nextEnabled = !settings.isLocalBackupEnabled;
+                              if (nextEnabled && !dirHandle) {
+                                await selectBackupFolder();
+                                return;
+                              }
+                              await saveSettings({
+                                isLocalBackupEnabled: nextEnabled,
+                                localBackupPath: nextEnabled
+                                  ? (dirHandle?.name || settings.localBackupPath || 'NavFOR_Local_Backup')
+                                  : settings.localBackupPath
+                              });
+                              if (nextEnabled && dirHandle) {
+                                await authorizeLocalFolderNow();
+                              }
+                            }}
+                            className={cn(
+                              "w-12 h-6 rounded-full p-1 transition-all duration-300 shrink-0 cursor-pointer",
+                              settings.isLocalBackupEnabled ? "bg-indigo-600" : "bg-slate-300"
+                            )}
+                            title={L('ローカルログの有効/無効を切り替え', 'Toggle Local Folder Log', 'Activer/désactiver le journal local')}
+                          >
+                            <div className={cn(
+                              "w-4 h-4 bg-white rounded-full shadow-sm transition-all duration-300",
+                              settings.isLocalBackupEnabled ? "translate-x-6" : "translate-x-0"
+                            )} />
+                          </button>
+                        </div>
+                        
+                        <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-inner space-y-4">
+                          {isLocalLogConfigured && !isLocalDiskReady && (
+                            <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                              <div className="text-xs text-amber-800">
+                                <p className="font-bold">
+                                  {dirHandle
+                                    ? L('ブラウザ再読み込み後の書き込み許可が必要です', 'Write permission needed after browser reload', 'Autorisation d\'écriture requise après rechargement')
+                                    : L('PCの保存先フォルダが接続されていません', 'Local PC folder is not connected yet', 'Le dossier PC local n\'est pas encore connecté')}
+                                </p>
+                                <p className="text-[11px] text-amber-700 mt-0.5">
+                                  {dirHandle
+                                    ? L('右のボタンを押すと、ローカルフォルダ内のCSVファイルを即座に最新状態へ上書き更新します。', 'Click the button to grant write access and immediately overwrite the local CSV file with the latest data.', 'Cliquez pour autoriser l\'accès et mettre à jour le fichier CSV local.')
+                                    : window.self !== window.top
+                                    ? L('プレビュー枠内ではフォルダ選択ダイアログが開けないため、「新しいタブで開く (↗)」から一度フォルダを選択してください（選択後はこの画面からも自動更新されます）。', 'Open in a new tab (↗) once to pick your PC folder. Once selected, changes here will also sync automatically.', 'Ouvrez dans un nouvel onglet (↗) pour choisir le dossier PC.')
+                                    : L('「フォルダを選択」からPC上の保存先フォルダを指定すると、変更のたびローカルファイルが自動更新されます。', 'Click "Select Folder" to choose a folder on your PC for automatic file updates.', 'Cliquez sur « Choisir dossier » pour sélectionner un dossier sur votre PC.')}
+                                </p>
+                              </div>
+                              {dirHandle ? (
+                                <button
+                                  onClick={authorizeLocalFolderNow}
+                                  className="px-3 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-[11px] font-bold shrink-0 transition-colors cursor-pointer shadow-sm"
+                                >
+                                  {L('書き込みを許可して今すぐ更新', 'Allow Write & Sync Now', 'Autoriser et synchroniser')}
+                                </button>
+                              ) : window.self !== window.top ? (
+                                <a
+                                  href={window.location.href}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="px-3 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-[11px] font-bold shrink-0 transition-colors cursor-pointer shadow-sm flex items-center gap-1"
+                                >
+                                  <ArrowUpRight size={13} />
+                                  {L('新しいタブで開いてフォルダ設定', 'Open in New Tab to Select Folder', 'Ouvrir dans un nouvel onglet')}
+                                </a>
+                              ) : (
+                                <button
+                                  onClick={selectBackupFolder}
+                                  className="px-3 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-[11px] font-bold shrink-0 transition-colors cursor-pointer shadow-sm"
+                                >
+                                  {t('SelectFolder')}
+                                </button>
+                              )}
+                            </div>
+                          )}
+
+                          <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+                            <div className="flex-1 min-w-0 w-full">
+                              <label className="text-[10px] font-bold text-slate-400 uppercase block mb-1">{t('LocalDirectoryPath')}</label>
+                              <div className="text-xs font-mono break-all py-1.5 text-slate-600 bg-slate-50 px-2.5 rounded border border-slate-100 flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <Activity size={12} className={cn("shrink-0", isLocalDiskReady ? "text-emerald-500" : "text-amber-500")} />
+                                  <span className="truncate">{dirHandle?.name || settings.localBackupPath || t('NoFolderSelected')}</span>
+                                </div>
+                                {isLocalDiskReady && (
+                                  <span className="text-[9px] font-sans font-bold text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200 shrink-0">
+                                    {L('ローカル直結・自動上書き中', 'Direct Disk Write Active', 'Écriture disque active')}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex flex-col gap-2 shrink-0 sm:pt-5 w-full sm:w-48">
+                              <button 
+                                onClick={selectBackupFolder}
+                                className="p-2 px-3 rounded-lg text-[10px] font-bold transition-colors w-full h-10 flex items-center justify-center bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer"
+                              >
+                                {t('SelectFolder')}
+                              </button>
+                              <button 
+                                onClick={() => {
+                                  if (dirHandle) {
+                                    authorizeLocalFolderNow();
+                                  } else {
+                                    downloadBackup();
+                                  }
+                                }}
+                                disabled={isSyncing}
+                                className="p-2 px-3 rounded-lg text-[10px] font-bold transition-all w-full h-10 flex items-center justify-center gap-1.5 bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 cursor-pointer"
+                              >
+                                <RefreshCcw size={12} className={cn(isSyncing && "animate-spin")} />
+                                {dirHandle
+                                  ? L(`今すぐローカル上書き (#${nextBackupSlot})`, `Overwrite Local Now (#${nextBackupSlot})`, `Écraser maintenant (#${nextBackupSlot})`)
+                                  : L(`手動バックアップ (#${nextBackupSlot})`, `Manual Backup (#${nextBackupSlot})`, `Sauvegarde (#${nextBackupSlot})`)}
+                              </button>
+                            </div>
+                            {window.self !== window.top && (
+                              <a 
+                                href={window.location.href}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="p-1.5 px-2 bg-slate-100 text-slate-600 rounded text-[10px] font-bold hover:bg-slate-200 transition-colors self-start sm:mt-5"
+                                title="Open in new tab to enable direct OS folder access"
+                              >
+                                <ArrowUpRight size={14} />
+                              </a>
+                            )}
+                          </div>
+
+                          {/* 3-File Backup Slots Status in Settings */}
+                          <div className="pt-3 border-t border-slate-100">
+                            <div className="flex items-center justify-between mb-2">
+                              <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider">
+                                {L('日次ローテーションバックアップ (1日ごと・最大3ファイル: 1, 2, 3)', 'Daily Rotating Backup Files (Per-Day, Max 3 Files: 1, 2, 3)', 'Fichiers de sauvegarde quotidiens (Par jour, Max 3 : 1, 2, 3)')}
+                              </span>
+                              <span className="text-[10px] font-mono font-bold text-indigo-600">
+                                {L(`本日の保存先: #${nextBackupSlot} (翌日: #${(nextBackupSlot % 3) + 1})`, `Today's File: #${nextBackupSlot} (Next Day: #${(nextBackupSlot % 3) + 1})`, `Fichier du jour : #${nextBackupSlot} (Jour suiv. : #${(nextBackupSlot % 3) + 1})`)}
+                              </span>
+                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                              {([1, 2, 3] as const).map((slotNum) => {
+                                const info = backupSlots[slotNum];
+                                const userPart = user?.email?.split('@')[0] || 'local';
+                                const defaultName = `NavFOR_Log_${userPart}_${slotNum}.csv`;
+                                return (
+                                  <div
+                                    key={slotNum}
+                                    className={cn(
+                                      "p-2.5 rounded-lg border flex flex-col justify-between gap-1.5",
+                                      info ? "bg-slate-50 border-slate-200" : "bg-slate-50/40 border-dashed border-slate-200"
+                                    )}
+                                  >
+                                    <div>
+                                      <div className="flex items-center justify-between gap-1 mb-1">
+                                        <span className={cn(
+                                          "px-1.5 py-0.5 rounded text-[9px] font-black",
+                                          info ? "bg-indigo-100 text-indigo-700" : "bg-slate-200 text-slate-500"
+                                        )}>
+                                          #{slotNum}
+                                        </span>
+                                        {info && (
+                                          <button
+                                            onClick={() => downloadBackupSlot(slotNum)}
+                                            className="text-[9px] font-bold text-indigo-600 hover:underline flex items-center gap-0.5"
+                                            title={L('このバックアップをダウンロード', 'Download this backup file', 'Télécharger ce fichier')}
+                                          >
+                                            <Download size={10} /> CSV
+                                          </button>
+                                        )}
+                                      </div>
+                                      <p className="text-[10px] font-mono font-bold text-slate-700 break-all leading-tight">
+                                        {info?.fileName || defaultName}
+                                      </p>
+                                    </div>
+                                    <div className="text-[9px] text-slate-400 font-medium">
+                                      {info
+                                        ? `${format(info.timestamp, 'yyyy/MM/dd HH:mm:ss')} (${info.taskCount} ${t('Items')})`
+                                        : L('未保存', 'Not saved yet', 'Non enregistré')}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="pt-6 border-t border-slate-200">
+                        <p className="font-bold text-red-600 flex items-center gap-2 mb-1">
+                          <AlertTriangle size={16} /> {t('DangerZone')}
+                        </p>
+                        <p className="text-[10px] text-slate-500 mb-4 uppercase font-black tracking-widest">Database Maintenance & Repair</p>
+                        
+                        <div className="bg-red-50 border border-red-100 rounded-xl p-4">
+                          <p className="text-[11px] text-red-800 font-bold mb-3 leading-relaxed">
+                            {t('ResetSettingsDesc')}
+                          </p>
+                          <button 
+                            onClick={forceResetSettings}
+                            className="w-full py-2.5 mb-3 bg-red-100 text-red-600 rounded-lg text-[10px] font-black uppercase tracking-[0.2em] hover:bg-red-200 transition-all flex items-center justify-center gap-2 border border-red-200"
+                          >
+                            <RefreshCcw size={14} /> {t('ForceResetSettings')}
+                          </button>
+                          
+                          <div className="h-px bg-red-200/50 my-4" />
+                          
+                          <p className="text-[11px] text-red-800 font-bold mb-3 leading-relaxed">
+                            CRITICAL: Delete ALL tasks in the cloud. This cannot be undone. An emergency backup will be created first if sync is enabled.
+                          </p>
+                          <div className="flex flex-col sm:flex-row gap-2">
+                             <button 
+                                onClick={purgeSectionData}
+                                className="flex-1 py-3 bg-red-100 text-red-600 rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-red-200 transition-all border border-red-200 flex items-center justify-center gap-2"
+                              >
+                                <Trash2 size={14} /> Purge "{activeSection}"
+                              </button>
+                              <button 
+                                onClick={purgeAllData}
+                                className="flex-1 py-3 bg-red-600 text-white rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-red-700 transition-all shadow-lg shadow-red-200 flex items-center justify-center gap-2"
+                              >
+                                <AlertCircle size={14} /> Purge All Content
+                              </button>
+                          </div>
+                        </div>
+                      </div>
+
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+            )}
+              </motion.div>
+            </AnimatePresence>
+          </div>
+
+          {/* Task Detail Pane (Right side, resizable, tabbed & split like VS Code — active in Dashboard, Archive & Trash) */}
+          {(viewMode === 'dashboard' || viewMode === 'archive' || viewMode === 'trash') &&
+            !(viewMode === 'dashboard' && mobileView === 'summary' && typeof window !== 'undefined' && window.innerWidth < 1024) && (
+            <>
+              {isDetailPaneVisible && (activeTabTaskId || openTaskIds.length > 0) && (
+                <TaskTabsDetail
+                  tasks={tasks}
+                  activeTaskId={activeTabTaskId}
+                  openTaskIds={openTaskIds}
+                  lastOpenEvent={lastOpenEvent}
+                  onSelectTask={(id, isPermanent) => {
+                    setActiveTabTaskId(id);
+                    if (isPermanent) {
+                      setLastOpenEvent({ taskId: id, isPermanent: true, timestamp: Date.now() });
+                    }
+                  }}
+                  onClose={handleMinimizeDetailPane}
+                  onMinimize={handleMinimizeDetailPane}
+                  onCloseAllTabs={handleCloseAllTabs}
+                  onOpenTaskIdsChange={setOpenTaskIds}
+                  onUpdateTask={updateTask}
+                  onMoveTask={moveTask}
+                  onDeleteTask={deleteTask}
+                  onToggleDone={toggleDone}
+                  onToggleStar={toggleStar}
+                  onTogglePin={togglePin}
+                  onDuplicateTask={handleDuplicateTask}
+                  folderMetas={folderMetas}
+                  onUpdateFolderMeta={updateFolderMeta}
+                  onArchiveFolder={handleArchiveFolder}
+                  onTrashFolder={handleTrashFolder}
+                  onToggleFolderStar={handleToggleFolderStar}
+                  onToggleFolderPin={handleToggleFolderPin}
+                  onShowMessage={setMessage}
+                  deadlineThresholdDays={settings.deadlineThreshold}
+                  language={settings.language}
+                  width={detailPaneWidth}
+                  onWidthChange={handleDetailPaneWidthChange}
+                  t={t}
+                />
+              )}
+
+              {/* Collapsed Detail Pane Bar when minimized with open tabs */}
+              {!isDetailPaneVisible && !isEffectiveTimelineFullscreen && (activeTabTaskId || openTaskIds.length > 0) && (
+                <div className="hidden lg:flex h-full shrink-0 flex-col items-center py-2 px-1 bg-slate-50/90 border-l border-slate-200 select-none w-10 transition-all z-10">
+                  <button
+                    type="button"
+                    onClick={handleExpandDetailPane}
+                    className="p-1.5 hover:bg-slate-200 text-slate-600 hover:text-indigo-600 rounded-md transition-colors"
+                    title={L('詳細ペインを展開 (タブを復元)', 'Expand Detail Pane (restore tabs)', 'Développer le panneau de détails')}
+                  >
+                    <FileText size={16} />
+                  </button>
+                  <div
+                    onClick={handleExpandDetailPane}
+                    className="mt-6 flex-1 cursor-pointer flex flex-col items-center justify-start text-slate-400 hover:text-indigo-600 transition-colors w-full"
+                    title={L('詳細ペインを展開 (タブを復元)', 'Expand Detail Pane (restore tabs)', 'Développer le panneau de détails')}
+                  >
+                    <span className="text-[10px] font-black tracking-widest uppercase [writing-mode:vertical-lr] select-none">
+                      {L('タスク詳細', 'TASK DETAIL', 'DÉTAILS')} ({openTaskIds.length})
+                    </span>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </main>
+    )}
+
+      {/* Footer Info Bar */}
+      <footer className={cn(
+        "bg-white border-t border-slate-200 px-6 py-2 items-center justify-between shrink-0",
+        isEffectiveTimelineFullscreen ? "hidden" : "hidden lg:flex"
+      )}>
+        <div className="flex gap-6 overflow-x-auto no-scrollbar text-[10px]">
+          <span className="font-bold text-slate-400 uppercase tracking-widest hidden sm:inline">Operational Status:</span>
+          <div className="flex items-center gap-2 whitespace-nowrap">
+            <div className="w-1.5 h-1.5 rounded-full bg-indigo-500"></div>
+            <span className="text-slate-600 font-medium font-mono lowercase tracking-tighter">[{viewMode}] REVIEW MODE</span>
+          </div>
+          <div className="flex items-center gap-2 whitespace-nowrap">
+            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></div>
+            <span className="text-slate-600 font-medium font-mono lowercase tracking-tighter">SWEEP LOG ACTIVE</span>
+          </div>
+        </div>
+        <div className="text-[10px] font-mono text-slate-400 font-extrabold ml-4 uppercase">
+          {`Navigation Focus Objectives & Results V${APP_VERSION}`}
+        </div>
+      </footer>
+
+      <AnimatePresence>
+        {isPickingDaily && (
+          <DailyPickModal 
+            tasks={tasks.filter(t => t.category === 'Focus' && !t.isDone)} 
+            onClose={() => setIsPickingDaily(false)} 
+            onPick={pickDailyTasks} 
+            t={t}
+            currentUrgentCount={stats.urgentCount}
+            limit={settings.urgentLimit}
+          />
+        )}
+        {editingTask && (
+          <EditTaskModal
+            task={editingTask}
+            onClose={() => setEditingTask(null)}
+            onSave={(updates) => updateTask(editingTask.id, updates)}
+            onMove={(newCat) => moveTask(editingTask.id, newCat)}
+            onDelete={() => deleteTask(editingTask.id)}
+            t={t}
+            projects={projects}
+          />
+        )}
+        {isAuthModalOpen && (
+          <AuthModal
+            isOpen={isAuthModalOpen}
+            onClose={() => {
+              setIsAuthModalOpen(false);
+              setAuthModalError(null);
+            }}
+            initialError={authModalError}
+            onSuccess={() => {
+              setIsAuthModalOpen(false);
+              setAuthModalError(null);
+              setMessage({ text: L("サインインに成功しました。クラウド同期が有効です。", "Signed in successfully. Cloud sync is active.", "Connexion réussie. La synchronisation cloud est active."), type: 'info' });
+            }}
+            language={settings.language}
+            onChangeLanguage={(lang) => saveSettings({ language: lang })}
+          />
+        )}
+        {isUserGuideOpen && (
+          <UserGuideModal
+            isOpen={isUserGuideOpen}
+            onClose={() => setIsUserGuideOpen(false)}
+            language={settings.language}
+            onChangeLanguage={(lang) => saveSettings({ language: lang })}
+          />
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+interface TaskCardProps {
+  task: Task;
+  onToggle: () => void;
+  onMove: (cat: Category) => void;
+  onDelete: () => void;
+  onEdit: () => void;
+  onStar: () => void;
+  onPin: () => void;
+  t: (key: string) => string;
+  variant?: 'Urgent' | 'Focus' | 'Archive' | 'Trash';
+  displayMode?: 'compact' | 'standard' | 'large';
+  deadlineThreshold?: number;
+}
+
+const TaskCard: React.FC<TaskCardProps> = ({ 
+  task, onToggle, onMove, onDelete, onEdit, onStar, onPin, t,
+  variant = 'Focus',
+  displayMode = 'standard',
+  deadlineThreshold = 3
+}) => {
+  const [showMenu, setShowMenu] = useState(false);
+  const [openUpwards, setOpenUpwards] = useState(false);
+  const [openToRight, setOpenToRight] = useState(false);
+  const buttonRef = React.useRef<HTMLDivElement>(null);
+  const menuRef = React.useRef<HTMLDivElement>(null);
+
+  const toggleMenu = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!showMenu && buttonRef.current) {
+      const rect = buttonRef.current.getBoundingClientRect();
+      const viewportWidth = window.innerWidth;
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const spaceRight = viewportWidth - rect.right;
+      
+      setOpenUpwards(spaceBelow < 250); 
+      
+      if (spaceRight >= 180) { // w-44 is 176px, adding a small buffer
+        setOpenToRight(true);
+      } else {
+        setOpenToRight(false);
+      }
+    }
+    setShowMenu(!showMenu);
+  };
+
+  React.useEffect(() => {
+    if (!showMenu) return;
+    const handleGlobalClick = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if ((buttonRef.current && buttonRef.current.contains(target)) ||
+          (menuRef.current && menuRef.current.contains(target))) {
+        return;
+      }
+      setShowMenu(false);
+    };
+    window.addEventListener('mousedown', handleGlobalClick, true);
+    return () => window.removeEventListener('mousedown', handleGlobalClick, true);
+  }, [showMenu]);
+
+  if (displayMode === 'compact') {
+    return (
+      <motion.div
+        layout
+        initial={{ opacity: 0, y: 5 }}
+        animate={{ opacity: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.95 }}
+        onClick={(e) => {
+          if ((e.target as HTMLElement).closest('button')) return;
+          onEdit();
+        }}
+        className={cn(
+          "bg-white rounded-lg p-2.5 shadow-sm border border-slate-100 group hover:border-indigo-300 transition-all flex items-center gap-3 cursor-pointer",
+          variant === 'Urgent' && "border-l-4 border-l-red-500",
+          task.isDone && "grayscale opacity-50 shadow-none",
+          showMenu && "relative z-30 shadow-xl border-indigo-200"
+        )}
+      >
+        <button 
+          onClick={(e) => { e.stopPropagation(); onToggle(); }}
+          className={cn(
+            "w-5 h-5 rounded border-2 transition-all flex items-center justify-center shrink-0",
+            task.isDone ? "bg-blue-500 border-blue-500" : "border-slate-300 hover:border-blue-400"
+          )}
+        >
+          {task.isDone && <CheckCircle2 size={12} className="text-white" />}
+        </button>
+
+        <div className="flex-1 min-w-0 pr-2">
+          <div className="flex items-center gap-2 mb-0.5">
+            <span className="text-[9px] font-mono font-bold text-slate-400">
+               ({formatDate(task.createdAt)})
+            </span>
+            {task.deadline && (
+              <span className={cn(
+                "text-[9px] font-bold px-1.5 py-0.5 rounded leading-none flex items-center gap-1",
+                (task.deadline - Date.now() <= deadlineThreshold * 86400000) 
+                  ? "bg-red-50 text-red-600 border border-red-100" 
+                  : "bg-slate-100 text-slate-500"
+              )}>
+                <Clock size={10} />
+                {task.isAllDay ? format(task.deadline, 'MM/dd') : format(task.deadline, 'MM/dd HH:mm')}
+              </span>
+            )}
+            <span className="text-[10px] font-bold text-indigo-500 bg-indigo-50 px-1.5 py-0.5 rounded leading-none shrink-0 truncate max-w-[80px]">
+              [{task.project}]
+            </span>
+          </div>
+          <p className={cn(
+            "text-xs font-semibold text-slate-800 truncate",
+            task.isDone && "line-through text-slate-400"
+          )}>
+            {task.title}
+          </p>
+        </div>
+
+        <div className="flex items-center gap-1.5 shrink-0">
+          <span className="hidden md:inline text-[9px] font-black text-slate-300 tabular-nums">
+            {format(task.updatedAt, 'MM/dd HH:mm')}
+          </span>
+          <button 
+            onClick={(e) => { e.stopPropagation(); onPin(); }}
+            className={cn(
+              "p-1 rounded transition-colors",
+              task.isPinned ? "text-indigo-600" : "text-slate-400 md:text-slate-200 md:hover:text-indigo-400"
+            )}
+            title={task.isPinned ? "Unpin task" : "Pin task"}
+          >
+            <Pin size={14} className={cn("rotate-45", task.isPinned && "fill-indigo-600")} />
+          </button>
+          <button 
+            onClick={(e) => { e.stopPropagation(); onStar(); }}
+            className={cn(
+              "p-1 rounded transition-colors",
+              task.isStarred ? "text-amber-500" : "text-slate-400 md:text-slate-200 md:hover:text-amber-400"
+            )}
+          >
+            <Star size={14} className={task.isStarred ? "fill-amber-500" : ""} />
+          </button>
+
+          {/* Shortcut buttons for mobile parity */}
+          {variant !== 'Urgent' && variant !== 'Archive' && variant !== 'Trash' && (
+            <button onClick={(e) => { e.stopPropagation(); onMove('Urgent'); }} className="p-1 px-1.5 hover:bg-red-50 text-red-500 rounded bg-red-50/30 md:bg-transparent" title={t('MoveToUrgent')}>
+              <Zap size={14} />
+            </button>
+          )}
+          {(variant === 'Archive' || variant === 'Trash' || variant === 'Urgent') && (
+            <button onClick={(e) => { e.stopPropagation(); onMove('Focus'); }} className="p-1 px-1.5 hover:bg-indigo-50 text-indigo-500 rounded bg-indigo-50/30 md:bg-transparent" title={t('RestoreToFocus')}>
+              <Target size={14} />
+            </button>
+          )}
+          
+          <div className="relative" ref={buttonRef}>
+            <button onClick={toggleMenu} className="p-1 hover:bg-slate-100 text-slate-400 rounded bg-slate-50 md:bg-transparent">
+              <MoreVertical size={14} />
+            </button>
+            {showMenu && createPortal(
+              <div 
+                ref={menuRef}
+                className={cn(
+                  "fixed w-44 bg-white border border-indigo-200 rounded-xl shadow-2xl z-[100] py-1 font-bold text-[10px] uppercase tracking-wider overflow-hidden"
+                )}
+                style={{
+                  top: openUpwards ? 'auto' : (buttonRef.current?.getBoundingClientRect().bottom || 0) + 4,
+                  bottom: openUpwards ? window.innerHeight - (buttonRef.current?.getBoundingClientRect().top || 0) + 4 : 'auto',
+                  left: openToRight 
+                    ? Math.max(8, (buttonRef.current?.getBoundingClientRect().left || 0)) 
+                    : Math.min(window.innerWidth - 184, (buttonRef.current?.getBoundingClientRect().right || 0) - 176),
+                }}
+              >
+                  {variant !== 'Urgent' && (
+                    <button onClick={(e) => { e.stopPropagation(); onMove('Urgent'); setShowMenu(false); }} className="w-full text-left px-4 py-3 hover:bg-red-50 text-red-600 border-b border-slate-50 flex items-center gap-2">
+                      <Zap size={12} className="text-red-400" /> {t('MoveToUrgent')}
+                    </button>
+                  )}
+                  {variant !== 'Focus' && (
+                    <button onClick={(e) => { e.stopPropagation(); onMove('Focus'); setShowMenu(false); }} className="w-full text-left px-4 py-3 hover:bg-indigo-50 text-indigo-600 border-b border-slate-50 flex items-center gap-2">
+                      <Target size={12} className="text-indigo-400" /> {t('RestoreToFocus')}
+                    </button>
+                  )}
+                  {variant !== 'Archive' && (
+                    <button onClick={(e) => { e.stopPropagation(); onMove('Archive'); setShowMenu(false); }} className="w-full text-left px-4 py-3 hover:bg-slate-50 text-slate-600 border-b border-slate-50 flex items-center gap-2">
+                      <ArchiveIcon size={12} className="text-slate-400" /> {t('ArchiveTask')}
+                    </button>
+                  )}
+                  {variant !== 'Trash' ? (
+                    <button onClick={(e) => { e.stopPropagation(); onMove('Trash'); setShowMenu(false); }} className="w-full text-left px-4 py-3 hover:bg-red-50 text-red-600 flex items-center gap-2">
+                       <Trash2 size={12} className="text-red-400" /> {t('MoveToTrash')}
+                    </button>
+                  ) : (
+                    <button onClick={(e) => { e.stopPropagation(); onDelete(); setShowMenu(false); }} className="w-full text-left px-4 py-3 hover:bg-red-50 text-red-600 flex items-center gap-2">
+                      <Trash2 size={12} className="text-red-400" /> {t('DeletePermanently')}
+                    </button>
+                  )}
+                </div>,
+                document.body
+            )}
+          </div>
+        </div>
+      </motion.div>
+    );
+  }
+
+  return (
+    <motion.div
+      layout
+      initial={{ opacity: 0, scale: 0.95 }}
+      animate={{ opacity: 1, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.9 }}
+      onClick={(e) => {
+        // Prevent clicking the card from triggering edit if we are clicking a button
+        if ((e.target as HTMLElement).closest('button')) return;
+        onEdit();
+      }}
+      className={cn(
+        "bg-white rounded-xl shadow-sm border border-slate-200 group hover:border-indigo-300 transition-all flex flex-col cursor-pointer",
+        displayMode === 'large' ? "p-5 md:p-6 gap-3" : "p-3 md:p-4",
+        variant === 'Urgent' && "border-l-4 border-l-red-500",
+        variant === 'Archive' && "opacity-70 grayscale",
+        task.isDone && "grayscale opacity-50",
+        showMenu && "relative z-30 shadow-xl border-indigo-200"
+      )}
+    >
+      <div className="flex items-start justify-between mb-1.5 min-w-0">
+        <div className="flex flex-col gap-0.5 min-w-0 pr-1">
+          {task.deadline && (
+            <>
+              <div className={cn(
+                "flex items-center gap-1 font-black uppercase tracking-tighter shrink-0",
+                displayMode === 'large' ? "text-[11px]" : "text-[9px]",
+                (task.deadline - Date.now()) < 0 ? "text-red-600" : 
+                (task.deadline - Date.now()) <= (deadlineThreshold * 86400000) ? "text-amber-600" : "text-slate-400"
+              )}>
+                <Clock size={displayMode === 'large' ? 12 : 10} />
+                <span>{task.isAllDay ? format(task.deadline, 'MM/dd') : format(task.deadline, 'MM/dd HH:mm')}</span>
+              </div>
+              <div className="flex items-center gap-1 text-[8px] font-bold text-slate-400 truncate opacity-70">
+                <span>({format(task.deadline, 'yyyyMMdd')})</span>
+                <span className="text-indigo-400/60">[{task.project}]</span>
+              </div>
+            </>
+          )}
+          {!task.deadline && (
+            <div className="text-[8px] font-bold text-indigo-400/60 truncate">
+              [{task.project}]
+            </div>
+          )}
+        </div>
+        <div className="flex items-center gap-0.5 shrink-0 ml-auto pt-0.5">
+          <button 
+            onClick={(e) => { e.stopPropagation(); onPin(); }}
+            className={cn(
+              "p-1 rounded transition-colors group/pin",
+              task.isPinned ? "text-indigo-600" : "text-slate-300 hover:text-indigo-400"
+            )}
+            title={task.isPinned ? "Unpin task" : "Pin task"}
+          >
+            <Pin size={displayMode === 'large' ? 14 : 12} className={cn("rotate-45", task.isPinned && "fill-indigo-600")} />
+          </button>
+          <button 
+            onClick={(e) => { e.stopPropagation(); onStar(); }}
+            className={cn(
+              "p-1 rounded transition-colors group/star",
+              task.isStarred ? "text-amber-500" : "text-slate-300 hover:text-amber-400"
+            )}
+            title={task.isStarred ? "Unstar task" : "Star task"}
+          >
+            {task.isStarred ? <Star size={displayMode === 'large' ? 14 : 12} className="fill-amber-500" /> : <Star size={displayMode === 'large' ? 14 : 12} />}
+          </button>
+          {(variant === 'Archive' || variant === 'Trash') && (
+            <button 
+              onClick={(e) => { e.stopPropagation(); onMove('Focus'); }}
+              className="text-[9px] font-black text-indigo-600 hover:underline flex items-center gap-0.5 ml-1"
+            >
+              RESTORE
+            </button>
+          )}
+        </div>
+      </div>
+      <p className={cn(
+        "font-semibold text-slate-800 leading-tight mb-2 break-words", 
+        displayMode === 'large' ? "text-sm md:text-lg" : "text-xs md:text-sm",
+        task.isDone && "line-through text-slate-400"
+      )}>
+        {task.title}
+      </p>
+
+      {task.urls && task.urls.length > 0 && (
+        <div className={cn("flex flex-wrap gap-1.5 mb-2", displayMode === 'large' && "gap-2 mb-3")}>
+          {task.urls.map((url, idx) => (
+            <a 
+              key={idx}
+              href={url.startsWith('http') ? url : `https://${url}`} 
+              target="_blank" 
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              className={cn(
+                "flex items-center gap-1 font-bold text-indigo-600 hover:text-indigo-800 transition-colors group/link bg-indigo-50/50 rounded border border-indigo-100/50 max-w-full",
+                displayMode === 'large' ? "text-[10px] px-2 py-1" : "text-[9px] px-1.5 py-0.5"
+              )}
+            >
+              <LinkIcon size={displayMode === 'large' ? 12 : 10} className="shrink-0 group-hover/link:rotate-12 transition-transform" />
+              <span className={cn("truncate", displayMode === 'large' ? "max-w-[180px]" : "max-w-[100px]")}>{url.replace(/^https?:\/\//, '')}</span>
+            </a>
+          ))}
+        </div>
+      )}
+      
+      {task.notes && (
+        <p className={cn(
+          "text-slate-500 mb-2 leading-relaxed italic",
+          displayMode === 'large' ? "text-[11px] bg-slate-50/80 p-2.5 rounded-lg border border-slate-100/80 block whitespace-pre-wrap line-clamp-3" : "text-[10px] line-clamp-2"
+        )}>
+          {task.notes}
+        </p>
+      )}
+      
+      <div className="flex items-center justify-between border-t border-slate-50 pt-2 mt-auto">
+        <div className="flex items-center gap-2">
+          <button 
+            onClick={(e) => { e.stopPropagation(); onToggle(); }}
+            className={cn(
+              "w-4 h-4 rounded border-2 transition-all flex items-center justify-center",
+              task.isDone ? "bg-blue-500 border-blue-500" : "border-slate-300 hover:border-blue-400"
+            )}
+          >
+            {task.isDone && <CheckCircle2 size={10} className="text-white" />}
+          </button>
+          <span className="text-[9px] text-slate-400 font-bold uppercase tracking-tighter">{format(task.updatedAt, 'MMM d HH:mm')}</span>
+        </div>
+
+        <div className="flex items-center gap-1 md:opacity-0 group-hover:opacity-100 transition-opacity">
+          {variant !== 'Urgent' && variant !== 'Archive' && variant !== 'Trash' && (
+            <button onClick={(e) => { e.stopPropagation(); onMove('Urgent'); }} className="p-2 md:p-1 hover:bg-red-50 text-red-500 rounded bg-red-50/30 md:bg-transparent" title={t('MoveToUrgent')}>
+              <Zap size={14} className="md:w-2.5 md:h-2.5" />
+            </button>
+          )}
+          {(variant === 'Archive' || variant === 'Trash' || variant === 'Urgent') && (
+            <button onClick={(e) => { e.stopPropagation(); onMove('Focus'); }} className="p-2 md:p-1 hover:bg-indigo-50 text-indigo-500 rounded bg-indigo-50/30 md:bg-transparent" title={t('RestoreToFocus')}>
+              <Target size={14} className="md:w-2.5 md:h-2.5" />
+            </button>
+          )}
+          <div className="relative" ref={buttonRef}>
+            <button onClick={toggleMenu} className="p-2 md:p-1 hover:bg-slate-100 text-slate-400 rounded bg-slate-50 md:bg-transparent">
+              <MoreVertical size={14} className="md:w-2.5 md:h-2.5" />
+            </button>
+            {showMenu && createPortal(
+              <div 
+                ref={menuRef}
+                className={cn(
+                  "fixed w-44 bg-white border border-indigo-200 rounded-xl shadow-2xl z-[100] py-1 font-bold text-[10px] uppercase tracking-wider overflow-hidden"
+                )}
+                style={{
+                  top: openUpwards ? 'auto' : (buttonRef.current?.getBoundingClientRect().bottom || 0) + 4,
+                  bottom: openUpwards ? window.innerHeight - (buttonRef.current?.getBoundingClientRect().top || 0) + 4 : 'auto',
+                  left: openToRight 
+                    ? Math.max(8, (buttonRef.current?.getBoundingClientRect().left || 0)) 
+                    : Math.min(window.innerWidth - 184, (buttonRef.current?.getBoundingClientRect().right || 0) - 176),
+                }}
+              >
+                  {variant !== 'Urgent' && (
+                    <button onClick={(e) => { e.stopPropagation(); onMove('Urgent'); setShowMenu(false); }} className="w-full text-left px-4 py-3 hover:bg-red-50 text-red-600 border-b border-slate-50 flex items-center gap-2">
+                      <Zap size={12} className="text-red-400" /> {t('MoveToUrgent')}
+                    </button>
+                  )}
+                  {variant !== 'Focus' && (
+                    <button onClick={(e) => { e.stopPropagation(); onMove('Focus'); setShowMenu(false); }} className="w-full text-left px-4 py-3 hover:bg-indigo-50 text-indigo-600 border-b border-slate-50 flex items-center gap-2">
+                      <Target size={12} className="text-indigo-400" /> {t('RestoreToFocus')}
+                    </button>
+                  )}
+                  {variant !== 'Archive' && (
+                    <button onClick={(e) => { e.stopPropagation(); onMove('Archive'); setShowMenu(false); }} className="w-full text-left px-4 py-3 hover:bg-slate-50 text-slate-600 border-b border-slate-50 flex items-center gap-2">
+                      <ArchiveIcon size={12} className="text-slate-400" /> {t('ArchiveTask')}
+                    </button>
+                  )}
+                  {variant !== 'Trash' ? (
+                    <button onClick={(e) => { e.stopPropagation(); onMove('Trash'); setShowMenu(false); }} className="w-full text-left px-4 py-3 hover:bg-red-50 text-red-600 flex items-center gap-2">
+                       <Trash2 size={12} className="text-red-400" /> {t('MoveToTrash')}
+                    </button>
+                  ) : (
+                    <button onClick={(e) => { e.stopPropagation(); onDelete(); setShowMenu(false); }} className="w-full text-left px-4 py-3 hover:bg-red-50 text-red-600 flex items-center gap-2">
+                      <Trash2 size={12} className="text-red-400" /> {t('DeletePermanently')}
+                    </button>
+                  )}
+                </div>,
+                document.body
+            )}
+          </div>
+        </div>
+      </div>
+    </motion.div>
+  );
+};
+
+function CalendarView({ tasks, onEdit, t, locale }: { tasks: Task[]; onEdit: (t: Task) => void; t: (key: string) => string; locale: any }) {
+  const [currentDate, setCurrentDate] = useState(new Date());
+  const [calendarMode, setCalendarMode] = useState<'year' | 'month' | 'week' | 'day'>('month');
+  const [showRecurrence, setShowRecurrence] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('navfor_calendar_show_recurrence');
+      return saved !== null ? saved === 'true' : true;
+    } catch {
+      return true;
+    }
+  });
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const ignoreScrollChange = useRef(true); 
+  const isTransitioning = useRef(false);
+
+  // Active tasks for calendar: anything not in Trash that has a deadline, startDate, or recurrence
+  const activeCalendarTasks = useMemo(() => {
+    return tasks.filter(t => 
+      t.category !== 'Trash' && 
+      (typeof t.deadline === 'number' || typeof t.startDate === 'number' || (t.recurrence && t.recurrence.type !== 'none'))
+    );
+  }, [tasks]);
+
+  const navigate = (direction: 'prev' | 'next') => {
+    ignoreScrollChange.current = false;
+    isTransitioning.current = true;
+    if (calendarMode === 'year') {
+      setCurrentDate(prev => direction === 'prev' ? subYears(prev, 1) : addYears(prev, 1));
+    } else if (calendarMode === 'month') {
+      setCurrentDate(prev => direction === 'prev' ? subMonths(prev, 1) : addMonths(prev, 1));
+    } else if (calendarMode === 'week') {
+      setCurrentDate(prev => direction === 'prev' ? subWeeks(prev, 1) : addWeeks(prev, 1));
+    } else {
+      setCurrentDate(prev => direction === 'prev' ? subDays(prev, 1) : addDays(prev, 1));
+    }
+    setTimeout(() => { isTransitioning.current = false; }, 500);
+  };
+
+  const goToToday = () => {
+    ignoreScrollChange.current = false;
+    isTransitioning.current = true;
+    setCurrentDate(new Date());
+    setTimeout(() => { isTransitioning.current = false; }, 500);
+  };
+
+  const lang = locale?.code?.startsWith('ja') ? 'ja' : locale?.code?.startsWith('fr') ? 'fr' : 'en';
+  const L = (ja: string, en: string, fr: string) => tr(lang, ja, en, fr);
+
+  return (
+    <div className="h-full flex flex-col bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
+      {/* Calendar Header */}
+      <header className="p-2 md:p-4 border-b border-slate-100 flex flex-col md:flex-row items-center justify-between gap-2 md:gap-4 bg-white sticky top-0 z-[60] landscape:flex-row landscape:p-1.5 landscape:gap-4">
+        <div className="flex flex-col sm:flex-row items-center gap-2 md:gap-4 w-full md:w-auto landscape:flex-row landscape:gap-2">
+          <div className="flex bg-slate-50 border border-slate-200 rounded-xl p-0.5 md:p-1 shadow-sm w-full sm:w-auto overflow-x-auto no-scrollbar landscape:w-auto landscape:p-0.5">
+            {(['year', 'month', 'week', 'day'] as const).map(mode => (
+              <button
+                key={mode}
+                onClick={() => setCalendarMode(mode)}
+                className={cn(
+                  "flex-1 sm:flex-initial px-2 md:px-4 py-1 md:py-1.5 rounded-lg text-[8px] md:text-[10px] font-black uppercase tracking-widest transition-all landscape:px-3 landscape:py-1",
+                  calendarMode === mode ? "bg-indigo-600 text-white shadow-md shadow-indigo-100" : "text-slate-400 hover:text-slate-600"
+                )}
+              >
+                {t(mode)}
+              </button>
+            ))}
+          </div>
+          <h2 className="hidden md:block text-lg font-black text-slate-800 tabular-nums uppercase tracking-tighter shrink-0 landscape:block landscape:text-sm">
+            {calendarMode === 'year' ? format(currentDate, 'yyyy', { locale }) : 
+             calendarMode === 'month' ? format(currentDate, 'MMMM yyyy', { locale }) :
+             calendarMode === 'week' ? `${t('WeekOf')} ${format(startOfWeek(currentDate, { locale }), 'MMM d', { locale })}` :
+             format(currentDate, 'PPP', { locale })}
+          </h2>
+        </div>
+
+        <div className="flex items-center justify-between md:justify-end w-full md:w-auto gap-2 md:gap-3 landscape:w-auto landscape:gap-2">
+          <h2 className="text-[9px] md:hidden md:text-sm font-black text-slate-800 tabular-nums uppercase tracking-tighter landscape:hidden">
+            {calendarMode === 'year' ? format(currentDate, 'yyyy', { locale }) : 
+             calendarMode === 'month' ? format(currentDate, 'MMM yyyy', { locale }) :
+             calendarMode === 'week' ? `W${format(startOfWeek(currentDate, { locale }), 'w', { locale })} ${format(startOfWeek(currentDate, { locale }), 'MMM d', { locale })}` :
+             format(currentDate, 'MMM d, yyyy', { locale })}
+          </h2>
+
+          {/* Recurrence Toggle (繰り返しを表示する/しない) */}
+          <label 
+            className="flex items-center gap-1.5 px-2 md:px-2.5 py-1 md:py-1.5 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-lg text-[8px] md:text-[10px] font-bold text-slate-700 cursor-pointer select-none transition-colors"
+            title={L("繰り返しのタスクを表示するか切り替えます", "Toggle display of repeating tasks", "Afficher/masquer les tâches récurrentes")}
+          >
+            <input
+              type="checkbox"
+              checked={showRecurrence}
+              onChange={(e) => {
+                const nextVal = e.target.checked;
+                setShowRecurrence(nextVal);
+                try {
+                  localStorage.setItem('navfor_calendar_show_recurrence', String(nextVal));
+                } catch {}
+              }}
+              className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 scale-90"
+            />
+            <Repeat size={12} className={showRecurrence ? "text-indigo-600 shrink-0" : "text-slate-400 shrink-0"} />
+            <span className="hidden sm:inline">{L('繰り返しを表示', 'Show Repeats', 'Afficher répétitions')}</span>
+            <span className="sm:hidden">{L('繰返', 'Repeat', 'Répét.')}</span>
+          </label>
+
+          <div className="flex items-center gap-1.5 md:gap-2">
+            <button 
+              onClick={goToToday}
+              className="px-1.5 md:px-3 py-1 md:py-1.5 bg-white border border-slate-200 rounded-lg text-[8px] md:text-[10px] font-bold text-slate-600 hover:border-indigo-200 hover:text-indigo-600 transition-all uppercase tracking-widest landscape:px-2 landscape:py-1"
+            >
+              {t('Today')}
+            </button>
+            <div className="flex items-center bg-white border border-slate-200 rounded-lg shadow-sm">
+              <button onClick={() => navigate('prev')} className="p-1 md:p-2 hover:bg-slate-50 text-slate-400 border-r border-slate-100 landscape:p-1">
+                <ChevronLeft size={12} className="md:w-4 md:h-4" />
+              </button>
+              <button onClick={() => navigate('next')} className="p-1 md:p-2 hover:bg-slate-50 text-slate-400 landscape:p-1">
+                <ChevronRight size={12} className="md:w-4 md:h-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* Calendar Content */}
+      <div ref={scrollContainerRef} className="flex-1 overflow-auto custom-scrollbar focus:outline-none relative">
+        {calendarMode === 'year' && (
+          <YearView 
+            scrollContainerRef={scrollContainerRef} 
+            ignoreScrollChange={ignoreScrollChange}
+            currentDate={currentDate} 
+            tasks={activeCalendarTasks}
+            showRecurrence={showRecurrence}
+            onDateSelect={(d) => { setCurrentDate(d); setCalendarMode('month'); }} 
+            onYearChange={setCurrentDate} 
+            locale={locale}
+          />
+        )}
+        {calendarMode === 'month' && (
+          <MonthView 
+            scrollContainerRef={scrollContainerRef} 
+            ignoreScrollChange={ignoreScrollChange}
+            currentDate={currentDate} 
+            tasks={activeCalendarTasks}
+            showRecurrence={showRecurrence}
+            onEdit={onEdit} 
+            onDateSelect={(d) => { setCurrentDate(d); setCalendarMode('day'); }} 
+            onMonthChange={setCurrentDate} 
+            locale={locale}
+          />
+        )}
+        {calendarMode === 'week' && (
+          <WeekView 
+            currentDate={currentDate} 
+            tasks={activeCalendarTasks} 
+            showRecurrence={showRecurrence}
+            onEdit={onEdit} 
+            locale={locale} 
+          />
+        )}
+        {calendarMode === 'day' && (
+          <DayView 
+            currentDate={currentDate} 
+            tasks={activeCalendarTasks} 
+            showRecurrence={showRecurrence}
+            onEdit={onEdit} 
+            locale={locale} 
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+const YearGrid = React.memo(({ yearDate, tasks, showRecurrence, onDateSelect, locale }: { yearDate: Date; tasks: Task[]; showRecurrence: boolean; onDateSelect: (d: Date) => void; locale: any }) => {
+  const year = yearDate.getFullYear();
+  const monthsData = useMemo(() => {
+    const months = eachMonthOfInterval({
+      start: startOfYear(yearDate),
+      end: endOfYear(yearDate)
+    });
+    const today = new Date();
+    return months.map(month => {
+      const days = eachDayOfInterval({
+        start: startOfMonth(month),
+        end: endOfMonth(month)
+      }).map(day => {
+        const dayTasksCount = tasks.filter(t => isTaskOccurringOnDate(t, day, showRecurrence)).length;
+        return {
+          date: day,
+          key: format(day, 'yyyy-MM-dd'),
+          dayNum: format(day, 'd'),
+          isToday: isSameDay(day, today),
+          count: dayTasksCount
+        };
+      });
+      return {
+        month,
+        monthName: format(month, 'MMMM', { locale }),
+        emptyDays: startOfWeek(startOfMonth(month), { locale }).getDay(),
+        days
+      };
+    });
+  }, [yearDate, tasks, showRecurrence, locale]);
+
+  const weekdays = useMemo(() => {
+    const start = startOfWeek(new Date(), { locale });
+    return Array.from({ length: 7 }).map((_, i) => format(addDays(start, i), 'EEEEE', { locale }));
+  }, [locale]);
+
+  return (
+    <div className="p-8 border-b border-slate-100" data-year={year.toString()}>
+      <h3 className="text-2xl font-black text-slate-800 mb-8 px-4">{year}</h3>
+      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-12">
+        {monthsData.map(mData => (
+          <div key={mData.month.toString()} className="space-y-4">
+            <button 
+              onClick={() => onDateSelect(mData.month)}
+              className="text-sm font-black text-indigo-600 uppercase tracking-widest hover:underline"
+            >
+              {mData.monthName}
+            </button>
+            <div className="grid grid-cols-7 gap-1 text-[8px] font-bold text-center">
+              {weekdays.map((d, idx) => (
+                <div key={`${d}-${idx}`} className="text-slate-400">{d}</div>
+              ))}
+              {Array.from({ length: mData.emptyDays }).map((_, i) => (
+                <div key={`empty-${i}`} />
+              ))}
+              {mData.days.map(dayInfo => (
+                <div 
+                  key={dayInfo.key}
+                  className={cn(
+                    "w-6 h-6 flex items-center justify-center rounded-full transition-all cursor-pointer",
+                    dayInfo.count > 5 ? "bg-red-500 text-white" :
+                    dayInfo.count > 2 ? "bg-amber-400 text-slate-800" :
+                    dayInfo.count > 0 ? "bg-indigo-100 text-indigo-600" :
+                    dayInfo.isToday ? "border border-indigo-500 text-indigo-500" : "text-slate-400 hover:bg-slate-100"
+                  )}
+                  onClick={() => onDateSelect(dayInfo.date)}
+                >
+                  {dayInfo.dayNum}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+});
+
+function YearView({ scrollContainerRef, ignoreScrollChange, currentDate, tasks, showRecurrence, onDateSelect, onYearChange, locale }: { scrollContainerRef: React.RefObject<HTMLDivElement>; ignoreScrollChange: React.RefObject<boolean>; currentDate: Date; tasks: Task[]; showRecurrence: boolean; onDateSelect: (d: Date) => void; onYearChange: (d: Date) => void; locale: any }) {
+  const lastReportedYear = useRef(currentDate.getFullYear().toString());
+  const isInitialScrollDone = useRef(false);
+
+  const years = useMemo(() => {
+    const list = [];
+    const currentYear = new Date().getFullYear();
+    for (let i = -5; i <= 5; i++) {
+        list.push(new Date(currentYear + i, 0, 1));
+    }
+    return list;
+  }, []);
+
+  useEffect(() => {
+    const observer = new IntersectionObserver((entries) => {
+      if (!isInitialScrollDone.current) return;
+      entries.forEach(entry => {
+        if (entry.isIntersecting && entry.intersectionRatio > 0.5) {
+          const yearStr = entry.target.getAttribute('data-year');
+          if (yearStr && yearStr !== lastReportedYear.current) {
+            lastReportedYear.current = yearStr;
+            const date = new Date(parseInt(yearStr), 0, 1);
+            ignoreScrollChange.current = true;
+            onYearChange(date);
+          }
+        }
+      });
+    }, {
+      root: scrollContainerRef.current,
+      threshold: 0.5
+    });
+
+    const yearElements = scrollContainerRef.current?.querySelectorAll('[data-year]');
+    yearElements?.forEach(el => observer.observe(el));
+    return () => observer.disconnect();
+  }, [years, onYearChange, scrollContainerRef]);
+
+  React.useEffect(() => {
+    const scrollToTarget = () => {
+      const currentYear = currentDate.getFullYear().toString();
+      const target = scrollContainerRef.current?.querySelector(`[data-year="${currentYear}"]`) as HTMLElement;
+      if (target && scrollContainerRef.current) {
+          scrollContainerRef.current.scrollTop = target.offsetTop;
+          setTimeout(() => {
+            isInitialScrollDone.current = true;
+          }, 200);
+          return true;
+      }
+      return false;
+    };
+
+    if (!scrollToTarget()) {
+      const timer = setTimeout(scrollToTarget, 100);
+      return () => clearTimeout(timer);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isInitialScrollDone.current) return;
+    if (ignoreScrollChange.current) {
+      ignoreScrollChange.current = false;
+      return;
+    }
+    const currentYear = currentDate.getFullYear().toString();
+    const target = scrollContainerRef.current?.querySelector(`[data-year="${currentYear}"]`);
+    if (target && scrollContainerRef.current) {
+        lastReportedYear.current = currentYear;
+        const container = scrollContainerRef.current;
+        const targetTop = (target as HTMLElement).offsetTop;
+        container.scrollTo({ top: targetTop, behavior: 'smooth' });
+    }
+  }, [currentDate, ignoreScrollChange]);
+
+  return (
+    <div className="bg-white relative">
+      {years.map(yearDate => (
+        <YearGrid 
+            key={yearDate.toString()} 
+            yearDate={yearDate} 
+            tasks={tasks} 
+            showRecurrence={showRecurrence}
+            onDateSelect={onDateSelect} 
+            locale={locale}
+        />
+      ))}
+    </div>
+  );
+}
+
+const MonthGrid = React.memo(({ monthDate, tasks, showRecurrence, onEdit, onDateSelect, locale }: { monthDate: Date; tasks: Task[]; showRecurrence: boolean; onEdit: (t: Task) => void; onDateSelect: (d: Date) => void; locale: any }) => {
+  const weeks = useMemo(() => {
+    const start = startOfWeek(startOfMonth(monthDate), { locale });
+    const end = endOfWeek(endOfMonth(monthDate), { locale });
+    const allDays = eachDayOfInterval({ start, end });
+    const chunked = [];
+    for (let i = 0; i < allDays.length; i += 7) {
+      const week = allDays.slice(i, i + 7).map(day => ({
+        date: day,
+        key: format(day, 'yyyy-MM-dd'),
+        isCurrentMonth: isSameMonth(day, monthDate),
+        isToday: isSameDay(day, new Date()),
+        dayNum: format(day, 'd'),
+        tasks: tasks.filter(t => isTaskOccurringOnDate(t, day, showRecurrence))
+      }));
+      chunked.push(week);
+    }
+    return chunked;
+  }, [monthDate, tasks, showRecurrence, locale]);
+
+  return (
+    <div className="flex flex-col mb-8" data-month={format(monthDate, 'yyyy-MM')}>
+      <div className="p-4 bg-slate-50 border-y border-slate-100 flex items-center justify-between sticky top-[34px] z-20 landscape:top-[28px] landscape:p-2">
+        <h3 className="text-sm font-black text-indigo-600 uppercase tracking-widest landscape:text-xs">
+          {format(monthDate, 'MMMM yyyy', { locale })}
+        </h3>
+      </div>
+      <div className="flex flex-col border-l border-slate-50">
+        {weeks.map((week, weekIdx) => (
+          <div key={weekIdx} className="grid grid-cols-7">
+            {week.map(dayInfo => {
+              const { date, isCurrentMonth, isToday, dayNum, tasks: dayTasks } = dayInfo;
+
+              return (
+                <div 
+                  key={dayInfo.key} 
+                  className={cn(
+                    "min-h-[120px] border-b border-r border-slate-50 p-2 flex flex-col gap-1 transition-colors hover:bg-slate-50/20 group",
+                    !isCurrentMonth && "bg-slate-100/10 opacity-30",
+                    isToday && "bg-indigo-50/20"
+                  )}
+                >
+                  <div className="flex justify-between items-center mb-1">
+                    <button 
+                      onClick={() => onDateSelect(date)}
+                      className={cn(
+                        "text-[10px] font-black tabular-nums py-0.5 px-1.5 rounded transition-all",
+                        isToday ? "bg-indigo-600 text-white shadow-sm" : "text-slate-400 group-hover:text-slate-600"
+                      )}
+                    >
+                      {dayNum}
+                    </button>
+                    {dayTasks.length > 0 && (
+                      <span className="text-[8px] font-bold text-indigo-400 opacity-60">
+                        {dayTasks.length}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex-1 flex flex-col gap-0.5 overflow-hidden">
+                    {dayTasks.slice(0, 5).map(task => (
+                      <button
+                        key={`${task.id}_${dayInfo.key}`}
+                        onClick={(e) => { e.stopPropagation(); onEdit(task); }}
+                        className={cn(
+                          "text-[8px] font-bold text-left px-1.5 py-0.5 rounded border truncate transition-all flex items-center gap-1",
+                          task.isDone ? "opacity-30 line-through bg-slate-100" : 
+                          task.category === 'Urgent' ? "bg-red-50 border-red-100 text-red-700 hover:bg-red-100" :
+                          "bg-indigo-50 border-indigo-100 text-indigo-700 hover:bg-white"
+                        )}
+                      >
+                        <span className="opacity-40 font-mono shrink-0">[{task.project}]</span>
+                        {!task.isAllDay && (task.deadline || task.startDate) && (
+                          <span className="opacity-60 font-mono text-[7px] shrink-0">{format(task.startDate || task.deadline!, 'HH:mm')}</span>
+                        )}
+                        {task.recurrence && task.recurrence.type !== 'none' && (
+                          <Repeat size={9} className="shrink-0 text-indigo-500" />
+                        )}
+                        <span className="truncate">{task.title}</span>
+                      </button>
+                    ))}
+                    {dayTasks.length > 5 && (
+                      <button 
+                        onClick={() => onDateSelect(date)}
+                        className="text-[8px] font-black text-indigo-400 hover:text-indigo-600 text-center py-0.5"
+                      >
+                        + {dayTasks.length - 5}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+});
+
+function MonthView({ scrollContainerRef, ignoreScrollChange, currentDate, tasks, showRecurrence, onEdit, onDateSelect, onMonthChange, locale }: { scrollContainerRef: React.RefObject<HTMLDivElement>; ignoreScrollChange: React.RefObject<boolean>; currentDate: Date; tasks: Task[]; showRecurrence: boolean; onEdit: (t: Task) => void; onDateSelect: (d: Date) => void; onMonthChange: (d: Date) => void; locale: any }) {
+  const isInitialScrollDone = useRef(false);
+  const lastReportedMonth = useRef(format(currentDate, 'yyyy-MM'));
+
+  const months = useMemo(() => {
+    const list = [];
+    const base = startOfMonth(new Date()); 
+    for (let i = -12; i <= 24; i++) {
+        list.push(addMonths(base, i));
+    }
+    return list;
+  }, []);
+
+  useEffect(() => {
+    const observer = new IntersectionObserver((entries) => {
+      if (!isInitialScrollDone.current) return;
+      entries.forEach(entry => {
+        if (entry.isIntersecting && entry.intersectionRatio > 0.4) {
+          const monthStr = entry.target.getAttribute('data-month');
+          if (monthStr && monthStr !== lastReportedMonth.current) {
+            lastReportedMonth.current = monthStr;
+            const [y, m] = monthStr.split('-').map(Number);
+            const date = new Date(y, m - 1, 1);
+            ignoreScrollChange.current = true;
+            onMonthChange(date);
+          }
+        }
+      });
+    }, {
+      root: scrollContainerRef.current,
+      threshold: 0.4
+    });
+
+    const monthElements = scrollContainerRef.current?.querySelectorAll('[data-month]');
+    monthElements?.forEach(el => observer.observe(el));
+    return () => observer.disconnect();
+  }, [months, onMonthChange, scrollContainerRef]);
+
+  React.useEffect(() => {
+    const scrollToTarget = () => {
+      const currentMonthStr = format(currentDate, 'yyyy-MM');
+      const target = scrollContainerRef.current?.querySelector(`[data-month="${currentMonthStr}"]`) as HTMLElement;
+      if (target && scrollContainerRef.current) {
+          scrollContainerRef.current.scrollTop = target.offsetTop;
+          setTimeout(() => {
+            isInitialScrollDone.current = true;
+          }, 200);
+          return true;
+      }
+      return false;
+    };
+
+    if (!scrollToTarget()) {
+      const timer = setTimeout(scrollToTarget, 100);
+      return () => clearTimeout(timer);
+    }
+  }, []); 
+
+  useEffect(() => {
+    if (!isInitialScrollDone.current) return;
+    if (ignoreScrollChange.current) {
+      ignoreScrollChange.current = false;
+      return;
+    }
+    
+    const currentMonthStr = format(currentDate, 'yyyy-MM');
+    const target = scrollContainerRef.current?.querySelector(`[data-month="${currentMonthStr}"]`);
+    if (target && scrollContainerRef.current) {
+        lastReportedMonth.current = currentMonthStr;
+        const container = scrollContainerRef.current;
+        const targetTop = (target as HTMLElement).offsetTop;
+        container.scrollTo({ top: targetTop, behavior: 'smooth' });
+    }
+  }, [currentDate, ignoreScrollChange]);
+
+  return (
+    <div className="bg-white min-w-[700px] relative">
+      <div className="grid grid-cols-7 border-b border-slate-100 bg-slate-50 sticky top-0 z-30 landscape:top-0 md:landscape:top-0">
+        {Array.from({ length: 7 }).map((_, i) => {
+          const dayName = format(addDays(startOfWeek(new Date(), { locale }), i), 'eee', { locale });
+          return (
+            <div key={i} className="py-2 text-[10px] font-black uppercase tracking-widest text-slate-400 text-center border-r border-slate-50 last:border-0">
+              {dayName}
+            </div>
+          );
+        })}
+      </div>
+      <div className="relative">
+        {months.map(month => (
+          <MonthGrid 
+              key={month.toString()} 
+              monthDate={month} 
+              tasks={tasks} 
+              showRecurrence={showRecurrence}
+              onEdit={onEdit} 
+              onDateSelect={onDateSelect} 
+              locale={locale}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function WeekView({ currentDate, tasks, showRecurrence, onEdit, locale }: { currentDate: Date; tasks: Task[]; showRecurrence: boolean; onEdit: (t: Task) => void; locale: any }) {
+  const weekDays = useMemo(() => {
+    const start = startOfWeek(currentDate, { locale });
+    const end = endOfWeek(currentDate, { locale });
+    return eachDayOfInterval({ start, end });
+  }, [currentDate, locale]);
+
+  return (
+    <div className="h-full flex flex-col min-w-[700px]">
+      <div className="grid grid-cols-7 h-full">
+        {weekDays.map(day => {
+          const dayTasks = tasks.filter(t => isTaskOccurringOnDate(t, day, showRecurrence));
+          const isToday = isSameDay(day, new Date());
+
+          return (
+            <div key={day.toString()} className={cn(
+              "flex flex-col border-r border-slate-100 last:border-0",
+              isToday && "bg-indigo-50/10"
+            )}>
+              <div className="p-4 border-b border-slate-50 flex flex-col items-center gap-1 bg-slate-50/30">
+                <span className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">{format(day, 'EEE', { locale })}</span>
+                <span className={cn(
+                  "w-8 h-8 flex items-center justify-center rounded-full text-sm font-black tabular-nums transition-all",
+                  isToday ? "bg-indigo-600 text-white shadow-lg shadow-indigo-100" : "text-slate-800"
+                )}>
+                  {format(day, 'd')}
+                </span>
+              </div>
+              <div className="flex-1 p-3 flex flex-col gap-2 overflow-y-auto custom-scrollbar">
+                {dayTasks.map(task => (
+                  <button
+                    key={`${task.id}_${day.toISOString()}`}
+                    onClick={() => onEdit(task)}
+                    className={cn(
+                      "p-3 rounded-xl border text-[10px] font-bold text-left transition-all hover:translate-y-[-1px] hover:shadow-md",
+                      task.isDone ? "grayscale opacity-40 bg-slate-100 border-slate-200" : 
+                      task.category === 'Urgent' ? "bg-red-50 border-red-100 text-red-700 shadow-sm shadow-red-100" :
+                      "bg-white border-slate-200 text-slate-700 shadow-sm"
+                    )}
+                  >
+                    <div className="flex items-center justify-between mb-1 opacity-50 font-mono text-[8px]">
+                      <span>{task.project}</span>
+                      <div className="flex items-center gap-1">
+                        {task.recurrence && task.recurrence.type !== 'none' && (
+                          <Repeat size={9} className="text-indigo-500" />
+                        )}
+                        {!task.isAllDay && (task.deadline || task.startDate) && format(task.startDate || task.deadline!, 'HH:mm')}
+                      </div>
+                    </div>
+                    <div className={cn(task.isDone && "line-through")}>
+                      {task.title}
+                    </div>
+                  </button>
+                ))}
+                {dayTasks.length === 0 && (
+                  <div className="flex-1 flex items-center justify-center border-2 border-dashed border-slate-100 rounded-2xl opacity-20">
+                    <span className="text-[10px] font-black uppercase tracking-widest text-slate-400 rotate-90">Empty</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function DayView({ currentDate, tasks, showRecurrence, onEdit, locale }: { currentDate: Date; tasks: Task[]; showRecurrence: boolean; onEdit: (t: Task) => void; locale: any }) {
+  const dayTasks = tasks.filter(t => isTaskOccurringOnDate(t, currentDate, showRecurrence));
+  const lang = locale?.code?.startsWith('ja') ? 'ja' : locale?.code?.startsWith('fr') ? 'fr' : 'en';
+  const L = (ja: string, en: string, fr: string) => tr(lang, ja, en, fr);
+  
+  return (
+    <div className="max-w-4xl mx-auto p-8 lg:p-12">
+      <div className="flex items-center gap-6 mb-12">
+        <div className="w-24 h-24 flex flex-col items-center justify-center bg-indigo-600 text-white rounded-3xl shadow-2xl shadow-indigo-200">
+          <span className="text-xs font-black uppercase tracking-[0.2em] opacity-80">{format(currentDate, 'MMM', { locale })}</span>
+          <span className="text-4xl font-black tabular-nums">{format(currentDate, 'd')}</span>
+        </div>
+        <div>
+          <h2 className="text-3xl font-black text-slate-800 tracking-tight">{format(currentDate, 'EEEE', { locale })}</h2>
+          <p className="text-sm font-bold text-slate-400 uppercase tracking-widest mt-1">{dayTasks.length} items scheduled</p>
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        {dayTasks.sort((a,b) => (a.startDate || a.deadline || 0) - (b.startDate || b.deadline || 0)).map(task => (
+          <button
+            key={`${task.id}_${currentDate.toISOString()}`}
+            onClick={() => onEdit(task)}
+            className={cn(
+              "w-full flex items-center gap-6 p-6 rounded-3xl border transition-all text-left group",
+              task.isDone ? "grayscale opacity-50 bg-slate-50 border-slate-100 shadow-none" : 
+              "bg-white border-slate-100 hover:border-indigo-300 shadow-sm hover:shadow-xl hover:shadow-indigo-100 hover:translate-x-2"
+            )}
+          >
+            <div className={cn(
+              "w-16 text-xs font-black tabular-nums text-slate-400 py-2 border-r flex items-center justify-center shrink-0",
+              !task.isAllDay && "text-indigo-600"
+            )}>
+              {task.isAllDay ? 'All Day' : format(task.startDate || task.deadline!, 'HH:mm')}
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-[10px] font-extrabold text-indigo-500 bg-indigo-50 px-2 py-0.5 rounded leading-none shrink-0 truncate max-w-[100px]">
+                  [{task.project}]
+                </span>
+                {task.recurrence && task.recurrence.type !== 'none' && (
+                  <span className="inline-flex items-center gap-1 text-[10px] font-bold text-indigo-600 bg-indigo-50/80 px-1.5 py-0.5 rounded">
+                    <Repeat size={10} />
+                    <span>
+                      {task.recurrence.type === 'daily'
+                        ? L('毎日', 'Daily', 'Quotidien')
+                        : task.recurrence.type === 'every_x_days'
+                          ? L(`${task.recurrence.interval || 1}日ごと`, `Every ${task.recurrence.interval || 1}d`, `Tous les ${task.recurrence.interval || 1} j`)
+                          : task.recurrence.type === 'weekly'
+                            ? L('毎週', 'Weekly', 'Hebdomadaire')
+                            : L(`${task.recurrence.interval || 1}週ごと`, `Every ${task.recurrence.interval || 1}w`, `Toutes les ${task.recurrence.interval || 1} sem`)}
+                    </span>
+                  </span>
+                )}
+                {task.isStarred && <Star size={12} className="text-amber-500 fill-amber-500" />}
+              </div>
+              <h3 className={cn("text-lg font-bold text-slate-800 leading-tight", task.isDone && "line-through text-slate-400")}>{task.title}</h3>
+              {task.notes && <p className="text-sm text-slate-500 mt-2 line-clamp-1 italic">{task.notes}</p>}
+            </div>
+            <ChevronRight className="text-slate-300 group-hover:text-indigo-400 group-hover:translate-x-1 transition-all" size={24} />
+          </button>
+        ))}
+        {dayTasks.length === 0 && (
+          <div className="py-32 flex flex-col items-center justify-center text-slate-200 border-4 border-dashed border-slate-50 rounded-[3rem]">
+            <Calendar size={64} strokeWidth={1} />
+            <p className="mt-4 text-xs font-black uppercase tracking-widest text-slate-400">Clear Schedule</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DailyPickModal({ tasks, onClose, onPick, t, currentUrgentCount, limit }: { tasks: Task[]; onClose: () => void; onPick: (ids: string[]) => void; t: (key: string, data?: any) => string; currentUrgentCount: number; limit: number }) {
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const remainingSlots = limit - currentUrgentCount;
+
+  const toggleSelect = (id: string) => {
+    if (selectedIds.includes(id)) {
+      setSelectedIds(selectedIds.filter(i => i !== id));
+    } else {
+      if (selectedIds.length >= remainingSlots) {
+        alert(t('ExtractLimitAlert', { n: remainingSlots }));
+        return;
+      }; 
+      setSelectedIds([...selectedIds, id]);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[200] flex items-center justify-center p-0 md:p-6">
+      <motion.div 
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="absolute inset-0 bg-orange-900/40 backdrop-blur-sm"
+        onClick={onClose}
+      />
+      <motion.div 
+        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.95, y: 20 }}
+        className="relative w-full max-w-lg h-full md:h-auto bg-white rounded-none md:rounded-3xl shadow-2xl overflow-hidden"
+      >
+        <div className="p-6 md:p-8 flex flex-col h-full">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-xl font-bold tracking-tight text-orange-600">{t('DailyChoice')}</h2>
+            <button onClick={onClose} className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-400">
+              <X size={20} />
+            </button>
+          </div>
+          <p className="text-sm text-slate-500 mb-6">{t('ExtractDesc', { n: Math.max(0, remainingSlots) })}</p>
+          
+          <div className="flex-1 md:max-h-96 overflow-y-auto space-y-2 mb-8 pr-2 custom-scrollbar">
+            {tasks.map(task => (
+              <button
+                key={task.id}
+                onClick={() => toggleSelect(task.id)}
+                className={cn(
+                  "w-full text-left p-4 rounded-xl border-2 transition-all flex items-start gap-4",
+                  selectedIds.includes(task.id) 
+                    ? "bg-orange-50 border-orange-200 ring-2 ring-orange-100" 
+                    : "bg-white border-slate-100 hover:border-orange-100"
+                )}
+              >
+                <div className={cn(
+                  "mt-1 w-5 h-5 rounded-full border-2 shrink-0 flex items-center justify-center transition-all",
+                  selectedIds.includes(task.id) ? "bg-orange-600 border-orange-600" : "border-slate-200"
+                )}>
+                  {selectedIds.includes(task.id) && <CheckCircle2 size={12} className="text-white" />}
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-[10px] font-bold text-slate-400 font-mono">({formatDate(task.createdAt)})</span>
+                    <span className="text-[10px] font-extrabold text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded leading-none">[{task.project}]</span>
+                  </div>
+                  <h3 className="text-sm font-semibold leading-tight">{task.title}</h3>
+                </div>
+              </button>
+            ))}
+            {tasks.length === 0 && (
+              <div className="text-center py-12 text-slate-400">
+                <Target size={40} className="mx-auto mb-4 opacity-20" />
+                <p className="text-sm font-medium">{t('NoFocusTasks')}</p>
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="text-sm font-medium text-slate-500">
+              <span className="text-orange-600 font-bold">{selectedIds.length}</span> / {remainingSlots} {t('Slots')}
+            </div>
+            <button 
+              onClick={() => onPick(selectedIds)}
+              disabled={selectedIds.length === 0}
+              className="px-6 py-3 bg-orange-600 text-white rounded-xl font-bold hover:bg-orange-700 disabled:opacity-50 transition-all active:scale-95 shadow-xl shadow-orange-100 flex items-center gap-2"
+            >
+              <Zap size={18} />
+              {t('SetDailyFocus')}
+            </button>
+          </div>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
+
+function EditTaskModal({ task, onClose, onSave, onMove, onDelete, t, projects }: { task: Task; onClose: () => void; onSave: (updates: Partial<Task>) => void; onMove: (cat: Category) => void; onDelete: () => void; t: (key: string) => string; projects: string[] }) {
+  const [title, setTitle] = useState(task.title);
+  const [project, setProject] = useState(task.project);
+  const [notes, setNotes] = useState(task.notes || '');
+  const [urls, setUrls] = useState<string[]>(task.urls && task.urls.length > 0 ? task.urls : ['']);
+  const [isStarred, setIsStarred] = useState(task.isStarred || false);
+  const [isPinned, setIsPinned] = useState(task.isPinned || false);
+  const [isDone, setIsDone] = useState(task.isDone || false);
+  const [isAllDay, setIsAllDay] = useState(task.isAllDay || false);
+  const [deadline, setDeadline] = useState(task.deadline ? format(task.deadline, task.isAllDay ? "yyyy-MM-dd" : "yyyy-MM-dd'T'HH:mm") : '');
+  const [isMemoModalOpen, setIsMemoModalOpen] = useState(false);
+  const [showActionsMobile, setShowActionsMobile] = useState(false);
+  const [showProjectPicker, setShowProjectPicker] = useState(false);
+
+  const currentDeadlineTimestamp = useMemo(() => {
+    if (!deadline) return 0;
+    try {
+      const dateObj = new Date(deadline);
+      if (isNaN(dateObj.getTime())) return 0;
+      if (isAllDay) {
+        dateObj.setHours(23, 59, 59, 999);
+      }
+      return dateObj.getTime();
+    } catch (e) {
+      return 0;
+    }
+  }, [deadline, isAllDay]);
+
+  const isDirty = title !== task.title || 
+                  project !== task.project ||
+                  notes !== (task.notes || '') || 
+                  JSON.stringify(urls.filter(u => u.trim() !== '')) !== JSON.stringify(task.urls || []) ||
+                  isStarred !== (task.isStarred || false) ||
+                  isPinned !== (task.isPinned || false) ||
+                  isDone !== (task.isDone || false) ||
+                  isAllDay !== (task.isAllDay || false) ||
+                  currentDeadlineTimestamp !== (task.deadline || 0);
+
+  const handleSubmit = (e?: React.FormEvent, shouldClose = false) => {
+    if (e) e.preventDefault();
+    if (isDirty) {
+      const finalDeadline = currentDeadlineTimestamp || null;
+      onSave({ 
+        title, 
+        project,
+        notes, 
+        urls: urls.filter(u => u.trim() !== ''),
+        isStarred,
+        isPinned,
+        isDone,
+        isAllDay,
+        deadline: finalDeadline as any // Using null to clear
+      });
+    }
+    if (shouldClose) onClose();
+  };
+
+  const handleClose = () => {
+    if (isDirty) {
+      handleSubmit(undefined, true);
+    } else {
+      onClose();
+    }
+  };
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // If MemoModal is open, we let it handle Ctrl+Enter
+      if (isMemoModalOpen) return;
+      
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        handleSubmit(undefined, true);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [title, notes, urls, isStarred, isPinned, isDone, deadline, isMemoModalOpen]);
+
+  const addUrlField = () => setUrls([...urls, '']);
+  const updateUrlField = (index: number, val: string) => {
+    const next = [...urls];
+    next[index] = val;
+    setUrls(next);
+  };
+  const removeUrlField = (index: number) => {
+    setUrls(urls.filter((_, i) => i !== index));
+  };
+
+  return (
+    <div className="fixed inset-0 z-[200] flex items-center justify-center p-0 md:p-6">
+      <motion.div 
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm"
+        onClick={handleClose}
+      />
+      <motion.div 
+        initial={{ opacity: 0, scale: 0.95, y: 10 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.95, y: 10 }}
+        className="relative w-full max-w-3xl h-full md:h-auto md:max-h-[90vh] bg-white rounded-none md:rounded-3xl shadow-2xl overflow-hidden flex flex-col md:flex-row"
+      >
+        <div className="p-6 md:p-8 flex-1 overflow-y-auto overflow-x-hidden custom-scrollbar">
+          <div className="flex items-center justify-between mb-6">
+            <h2 className="text-xl font-bold tracking-tight">{t('TaskDetail')}</h2>
+            <div className="flex items-center gap-2">
+              <button 
+                type="button"
+                onClick={() => setShowActionsMobile(true)} 
+                className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-400 md:hidden"
+                title="System Actions"
+              >
+                <MoreVertical size={20} />
+              </button>
+              <button 
+                type="button"
+                onClick={handleClose} 
+                className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-400 md:hidden"
+              >
+                <X size={20} />
+              </button>
+            </div>
+          </div>
+          
+          <form onSubmit={handleSubmit} className="space-y-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-slate-100 flex-wrap">
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setShowProjectPicker(!showProjectPicker)}
+                  className="text-[10px] font-black uppercase tracking-widest text-indigo-600 bg-indigo-50 px-2.5 py-1.5 rounded-lg border border-indigo-100/50 hover:bg-indigo-100 transition-colors flex items-center gap-1"
+                >
+                  {project}
+                  <ChevronDown size={10} />
+                </button>
+                
+                <AnimatePresence>
+                  {showProjectPicker && (
+                    <>
+                      <div 
+                        className="fixed inset-0 z-10" 
+                        onClick={() => setShowProjectPicker(false)}
+                      />
+                      <motion.div
+                        initial={{ opacity: 0, y: -10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -10 }}
+                        className="absolute top-full left-0 mt-1 w-48 bg-white border border-slate-200 shadow-xl rounded-xl py-1 z-20 overflow-hidden"
+                      >
+                        <div className="max-h-40 overflow-y-auto custom-scrollbar">
+                          {projects.filter(p => p !== 'All').map(p => (
+                            <button
+                              key={p}
+                              type="button"
+                              onClick={() => {
+                                setProject(p);
+                                setShowProjectPicker(false);
+                              }}
+                              className={cn(
+                                "w-full text-left px-3 py-2 text-[11px] font-bold hover:bg-slate-50 transition-colors flex items-center justify-between",
+                                project === p ? "text-indigo-600 bg-indigo-50/50" : "text-slate-600"
+                              )}
+                            >
+                              {p}
+                              {project === p && <div className="w-1.5 h-1.5 rounded-full bg-indigo-500" />}
+                            </button>
+                          ))}
+                        </div>
+                      </motion.div>
+                    </>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              <div className="flex items-center gap-2 flex-wrap">
+                <button 
+                  type="button"
+                  onClick={() => setIsDone(!isDone)}
+                  className={cn(
+                    "h-8 px-2.5 rounded-lg border flex items-center gap-1.5 text-[11px] font-bold transition-all",
+                    isDone ? "bg-blue-50 border-blue-200 text-blue-500" : "bg-slate-50 border-transparent text-slate-400 hover:border-slate-200"
+                  )}
+                  title={isDone ? t('MarkUndone') : t('MarkDone')}
+                >
+                  <CheckCircle2 size={14} className={isDone ? "fill-blue-500 text-white" : ""} />
+                  <span>{t('Done')}</span>
+                </button>
+                <button 
+                  type="button"
+                  onClick={() => setIsPinned(!isPinned)}
+                  className={cn(
+                    "h-8 px-2.5 rounded-lg border flex items-center gap-1.5 text-[11px] font-bold transition-all",
+                    isPinned ? "bg-indigo-50 border-indigo-200 text-indigo-500" : "bg-slate-50 border-transparent text-slate-400 hover:border-slate-200"
+                  )}
+                  title={t('Pin')}
+                >
+                  <Pin size={14} className={cn("rotate-45", isPinned && "fill-indigo-500")} />
+                  <span>{t('Pin')}</span>
+                </button>
+                <button 
+                  type="button"
+                  onClick={() => setIsStarred(!isStarred)}
+                  className={cn(
+                    "h-8 px-2.5 rounded-lg border flex items-center gap-1.5 text-[11px] font-bold transition-all",
+                    isStarred ? "bg-amber-50 border-amber-200 text-amber-500" : "bg-slate-50 border-transparent text-slate-400 hover:border-slate-200"
+                  )}
+                  title={t('Star')}
+                >
+                  <Star size={14} className={isStarred ? "fill-amber-500" : ""} />
+                  <span>{t('Star')}</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 px-1">{t('TaskDescription')}</label>
+              <textarea 
+                autoFocus
+                className={cn(
+                  "w-full px-5 py-4 bg-slate-50 border-2 border-transparent focus:bg-white focus:border-indigo-500 rounded-2xl text-lg font-medium outline-none transition-all resize-none h-28",
+                  isDone && "opacity-60 text-slate-400 line-through font-normal"
+                )}
+                placeholder={t('DetailsPlaceholder')}
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between px-1">
+                <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{t('Memos')}</label>
+                <button 
+                  type="button" 
+                  onClick={() => setIsMemoModalOpen(true)}
+                  className="flex items-center gap-1 text-[10px] font-bold text-indigo-600 hover:underline"
+                >
+                  <ExternalLink size={10} /> {t('Maximize')}
+                </button>
+              </div>
+              <textarea 
+                placeholder={t('ContextSubtasks')}
+                className="w-full px-5 py-4 bg-slate-50 border-2 border-transparent focus:bg-white focus:border-indigo-500 rounded-2xl text-sm font-medium outline-none transition-all resize-none h-32"
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+              />
+            </div>
+            
+            <AnimatePresence>
+              {isMemoModalOpen && (
+                <MemoModal 
+                  value={notes}
+                  onChange={setNotes}
+                  onSave={handleSubmit}
+                  onClose={() => setIsMemoModalOpen(false)}
+                  placeholder={t('BroadViewMemoPlaceholder')}
+                />
+              )}
+            </AnimatePresence>
+            
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between px-1">
+                <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5 opacity-60">
+                  <Calendar size={12} />
+                  {t('Deadline')}
+                </label>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => {
+                        const newAllDay = !isAllDay;
+                        setIsAllDay(newAllDay);
+                        if (deadline) {
+                            // Re-format existing deadline date
+                            const d = new Date(deadline);
+                            setDeadline(format(d, newAllDay ? "yyyy-MM-dd" : "yyyy-MM-dd'T'HH:mm"));
+                        }
+                    }}
+                    className={cn(
+                        "p-1.5 rounded-lg border flex items-center justify-center transition-all",
+                        isAllDay ? "bg-indigo-600 border-indigo-600 text-white" : "bg-white border-slate-200 text-slate-400"
+                    )}
+                    title={isAllDay ? "Switch to Time" : "Switch to All Day"}
+                  >
+                    {isAllDay ? <Clock size={12} /> : <span className="text-[9px] font-black leading-none">ALL DAY</span>}
+                  </button>
+                  {deadline && (
+                    <button 
+                      type="button"
+                      onClick={() => setDeadline('')}
+                      className="text-[10px] font-bold text-red-500 hover:underline"
+                    >
+                      {t('Clear')}
+                    </button>
+                  )}
+                </div>
+              </div>
+              <input 
+                type={isAllDay ? "date" : "datetime-local"}
+                className="w-full px-5 py-3 bg-slate-50 border-2 border-transparent focus:bg-white focus:border-indigo-500 rounded-2xl text-[11px] font-medium outline-none transition-all text-slate-400 [&::-webkit-calendar-picker-indicator]:opacity-30 [&::-webkit-calendar-picker-indicator]:invert-[0.2] [&::-webkit-calendar-picker-indicator]:cursor-pointer"
+                value={deadline}
+                onChange={(e) => setDeadline(e.target.value)}
+              />
+            </div>
+
+            <div className="space-y-3">
+              <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 px-1 flex items-center justify-between">
+                <span className="flex items-center gap-1.5"><LinkIcon size={10} /> {t('Urls')}</span>
+                <button 
+                  type="button" 
+                  onClick={addUrlField}
+                  className="text-indigo-600 hover:underline px-2"
+                >
+                  + {t('Add')}
+                </button>
+              </label>
+              <div className="space-y-2">
+                {urls.map((u, idx) => (
+                  <div key={idx} className="flex gap-2">
+                    <div className="relative flex-1">
+                      <input 
+                        type="url"
+                        placeholder={t('UrlPlaceholder')}
+                        className={cn(
+                          "w-full px-5 py-3 bg-slate-50 border-2 border-transparent focus:bg-white focus:border-indigo-500 rounded-xl text-sm font-medium outline-none transition-all",
+                          u.trim() && "pr-12"
+                        )}
+                        value={u}
+                        onChange={(e) => updateUrlField(idx, e.target.value)}
+                      />
+                      {u.trim() && (
+                        <a 
+                          href={u.startsWith('http') ? u : `https://${u}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="absolute right-4 top-1/2 -translate-y-1/2 text-indigo-400 hover:text-indigo-600 transition-colors"
+                        >
+                          <ExternalLink size={18} />
+                        </a>
+                      )}
+                    </div>
+                    {urls.length > 1 && (
+                      <button 
+                        type="button"
+                        onClick={() => removeUrlField(idx)}
+                        className="p-3 bg-red-50 text-red-400 hover:text-red-500 rounded-xl"
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex gap-3 pt-4">
+              <button 
+                type="button"
+                onClick={() => onClose()}
+                className="flex-1 py-4 bg-slate-100 text-slate-600 rounded-2xl font-bold text-sm hover:bg-slate-200 transition-all active:scale-95"
+              >
+                {t('Cancel')}
+              </button>
+              <button 
+                type="submit"
+                disabled={!title.trim()}
+                onClick={(e) => { e.preventDefault(); handleSubmit(undefined, true); }}
+                className="flex-[2] py-4 bg-indigo-600 text-white rounded-2xl font-bold text-sm hover:bg-indigo-700 disabled:opacity-50 transition-all active:scale-95 shadow-xl shadow-indigo-100"
+              >
+                {t('CommitChanges')}
+              </button>
+            </div>
+          </form>
+        </div>
+
+        {/* Sidebar Actions */}
+        <div className={cn(
+          "bg-slate-50 p-6 md:p-8 w-full md:w-64 border-l border-slate-100 flex flex-col overflow-y-auto custom-scrollbar pb-24 md:pb-8 transition-transform duration-300",
+          "fixed inset-x-0 bottom-0 top-[60px] z-20 md:relative md:inset-auto md:top-auto md:z-auto",
+          showActionsMobile ? "translate-y-0" : "translate-y-full md:translate-y-0"
+        )}>
+          <div className="flex items-center justify-between mb-6">
+            <h3 className="text-[10px] font-bold uppercase tracking-widest text-slate-400">{t('SystemActions')}</h3>
+            <button 
+              type="button"
+              onClick={() => setShowActionsMobile(false)} 
+              className="p-2 hover:bg-slate-200 rounded-full transition-colors text-slate-400 md:hidden"
+            >
+              <X size={20} />
+            </button>
+            <button 
+              type="button"
+              onClick={handleClose} 
+              className="p-2 hover:bg-slate-200 rounded-full transition-colors text-slate-400 hidden md:flex"
+            >
+              <X size={20} />
+            </button>
+          </div>
+          
+          <div className="space-y-3">
+            {task.category !== 'Urgent' && (
+              <button 
+                onClick={() => { onMove('Urgent'); handleSubmit(); onClose(); }}
+                className="w-full flex items-center gap-3 px-4 py-3 bg-red-50 border border-red-100 rounded-xl text-xs font-bold text-red-600 hover:bg-red-100 transition-all group"
+              >
+                <Zap size={16} className="text-red-400" />
+                {t('MoveToUrgent')}
+              </button>
+            )}
+            {task.category !== 'Focus' && (
+              <button 
+                onClick={() => { onMove('Focus'); handleSubmit(); onClose(); }}
+                className="w-full flex items-center gap-3 px-4 py-3 bg-indigo-50 border border-indigo-100 rounded-xl text-xs font-bold text-indigo-600 hover:bg-indigo-100 transition-all group"
+              >
+                <Target size={16} className="text-indigo-400" />
+                {t('RestoreToFocus')}
+              </button>
+            )}
+            {task.category !== 'Archive' && (
+              <button 
+                onClick={() => { onMove('Archive'); handleSubmit(); onClose(); }}
+                className="w-full flex items-center gap-3 px-4 py-3 bg-white border border-slate-200 rounded-xl text-xs font-bold text-slate-600 hover:border-indigo-300 hover:text-indigo-600 transition-all group"
+              >
+                <ArchiveIcon size={16} className="text-slate-300 group-hover:text-indigo-400" />
+                {t('ArchiveTask')}
+              </button>
+            )}
+            {task.category !== 'Trash' ? (
+              <button 
+                onClick={() => { onMove('Trash'); handleSubmit(); onClose(); }}
+                className="w-full flex items-center gap-3 px-4 py-3 bg-white border border-slate-200 rounded-xl text-xs font-bold text-red-500 hover:bg-red-50 hover:border-red-200 transition-all"
+              >
+                <Trash2 size={16} className="text-red-300" />
+                {t('MoveToTrash')}
+              </button>
+            ) : (
+                <button 
+                  onClick={() => { if(confirm(t('DeleteConfirm'))) { onDelete(); onClose(); } }}
+                  className="w-full flex items-center gap-3 px-4 py-3 bg-red-50 border border-red-200 rounded-xl text-xs font-bold text-red-600 hover:bg-red-600 hover:text-white transition-all shadow-lg shadow-red-100"
+                >
+                  <Trash2 size={16} />
+                  {t('DeletePermanently')}
+                </button>
+            )}
+          </div>
+
+          <div className="mt-auto pt-8">
+            <div className="p-4 bg-white rounded-2xl border border-slate-100 shadow-sm transition-all">
+              <p className="text-[9px] font-bold text-slate-400 uppercase tracking-tighter mb-2">{t('Metadata')}</p>
+              <div className="space-y-1.5 font-mono text-[9px] text-slate-500">
+                <div className="flex justify-between">
+                  <span>ID:</span>
+                  <span className="text-slate-800">{task.id.slice(0, 8)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Created:</span>
+                  <span className="text-slate-800">{format(task.createdAt, 'MMM d, HH:mm')}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Category:</span>
+                  <span className="text-indigo-600 italic font-bold">{task.category}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </motion.div>
+
+    </div>
+  );
+}
+
+function MemoModal({ value, onChange, onSave, onClose, placeholder }: { value: string; onChange: (v: string) => void; onSave: () => void; onClose: () => void; placeholder?: string }) {
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        onSave();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onSave, onClose]);
+
+  return (
+    <div className="fixed inset-0 z-[300] flex items-center justify-center p-0 md:p-4">
+      <motion.div 
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="absolute inset-0 bg-slate-900/60 backdrop-blur-md"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+      />
+      <motion.div 
+        initial={{ opacity: 0, y: 20, scale: 0.95 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: 20, scale: 0.95 }}
+        onClick={(e) => e.stopPropagation()}
+        className="relative w-full max-w-4xl h-full md:h-[85vh] sm:md:h-[80vh] bg-white rounded-none md:rounded-3xl overflow-hidden flex flex-col shadow-2xl"
+      >
+        <div className="flex items-center justify-between p-6 bg-slate-50 border-b border-slate-100">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-indigo-100 rounded-xl flex items-center justify-center text-indigo-600">
+              <ExternalLink size={20} />
+            </div>
+            <div>
+              <h3 className="text-xl font-bold text-slate-800">Broad View Memo</h3>
+              <p className="text-[10px] text-slate-400 uppercase font-black tracking-widest">Enhanced context editor</p>
+            </div>
+          </div>
+          <button 
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onClose();
+            }}
+            className="p-3 bg-white hover:bg-slate-100 text-slate-400 rounded-2xl border border-slate-200 transition-all"
+          >
+            <X size={20} />
+          </button>
+        </div>
+        
+        <div className="flex-1 p-6">
+          <textarea 
+            className="w-full h-full p-8 bg-slate-50 border-2 border-slate-100 rounded-[1.5rem] text-lg font-medium text-slate-700 outline-none focus:bg-white focus:border-indigo-500 transition-all resize-none custom-scrollbar shadow-inner"
+            placeholder={placeholder || "Deep dive into context, sub-tasks, or brainstorm ideas here..."}
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                onSave();
+                onClose();
+              }
+            }}
+            autoFocus
+          />
+        </div>
+        
+        <div className="p-4 bg-slate-50 border-t border-slate-100 flex items-center justify-between">
+          <div className="flex gap-4">
+             <div className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-tighter">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                Auto-saving to temporary buffer
+             </div>
+          </div>
+          <button 
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onSave();
+              onClose();
+            }}
+            className="px-8 py-3 bg-indigo-600 text-white rounded-2xl text-xs font-black uppercase tracking-widest hover:bg-indigo-700 hover:shadow-lg hover:shadow-indigo-200 transition-all"
+          >
+            Finish Editing
+          </button>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
