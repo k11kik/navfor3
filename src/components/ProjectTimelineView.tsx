@@ -90,7 +90,7 @@ export const getTaskDeadlineAlert = (deadline?: number, isDone?: boolean, langua
     return {
       isOverdue: true,
       label: tr(language, '期限切', 'Overdue', 'Retard'),
-      tooltip: tr(language, `期限切れ: ${format(targetDate, 'yyyy/MM/dd HH:mm')}`, `Overdue: ${format(targetDate, 'yyyy/MM/dd HH:mm')}`, `En retard : ${format(targetDate, 'yyyy/MM/dd HH:mm')}`)
+      tooltip: tr(language, `期限切れ: ${format(targetDate, 'yyyy/MM/dd HH:mm')}`, `Overdue: ${format(targetDate, 'MM/dd/yyyy HH:mm')}`, `En retard : ${format(targetDate, 'dd/MM/yyyy HH:mm')}`)
     };
   }
   if (isTargetToday) {
@@ -104,14 +104,14 @@ export const getTaskDeadlineAlert = (deadline?: number, isDone?: boolean, langua
     return {
       isOverdue: false,
       label: tr(language, '明日', 'Tomorrow', 'Demain'),
-      tooltip: tr(language, `明日締切: ${format(targetDate, 'MM/dd')}`, `Due tomorrow: ${format(targetDate, 'MM/dd')}`, `Échéance demain : ${format(targetDate, 'MM/dd')}`)
+      tooltip: tr(language, `明日締切: ${format(targetDate, 'MM/dd')}`, `Due tomorrow: ${format(targetDate, 'MM/dd')}`, `Échéance demain : ${format(targetDate, 'dd/MM')}`)
     };
   }
   if (daysDiff <= 3 && daysDiff > 0) {
     return {
       isOverdue: false,
       label: tr(language, `あと${daysDiff}日`, `In ${daysDiff}d`, `Dans ${daysDiff}j`),
-      tooltip: tr(language, `締切間近: ${format(targetDate, 'MM/dd')}`, `Due soon: ${format(targetDate, 'MM/dd')}`, `Échéance proche : ${format(targetDate, 'MM/dd')}`)
+      tooltip: tr(language, `締切間近: ${format(targetDate, 'MM/dd')}`, `Due soon: ${format(targetDate, 'MM/dd')}`, `Échéance proche : ${format(targetDate, 'dd/MM')}`)
     };
   }
   return null;
@@ -152,6 +152,7 @@ interface ProjectTimelineViewProps {
   onToggleFolderPin?: (folderPath: string) => void;
   isFullscreen?: boolean;
   onToggleFullscreen?: () => void;
+  onOpenCreateTaskModal?: (defaultProject?: string) => void;
   t: (key: string) => string;
 }
 
@@ -181,6 +182,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
   onToggleFolderPin,
   isFullscreen = false,
   onToggleFullscreen,
+  onOpenCreateTaskModal,
   t
 }) => {
   const L = (ja: string, en: string, fr: string) => tr(language, ja, en, fr);
@@ -242,7 +244,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
   const [editingColumnLabel, setEditingColumnLabel] = useState('');
 
   // Calendar Timeline view window state (start date, number of days visible)
-  const [windowStartDate, setWindowStartDate] = useState<Date>(() => subDays(startOfDay(new Date()), 2));
+  const [windowStartDate, setWindowStartDate] = useState<Date>(() => startOfDay(new Date()));
   const [daysCount, setDaysCount] = useState<number>(14); // 7, 14, 21, 30
   const [showUnscheduledColumn, setShowUnscheduledColumn] = useState(true);
   const [collapsedProjectPaths, setCollapsedProjectPaths] = useState<Set<string>>(new Set());
@@ -1658,7 +1660,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
 
   const handleNavigate = (direction: 'prev' | 'next' | 'today') => {
     if (direction === 'today') {
-      setWindowStartDate(subDays(startOfDay(new Date()), 2));
+      setWindowStartDate(startOfDay(new Date()));
     } else if (direction === 'prev') {
       setWindowStartDate(prev => subDays(prev, 7));
     } else {
@@ -2091,7 +2093,11 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
 
           {timelineMode === 'calendar' && (
             <span className="text-[11px] font-mono text-slate-500 hidden sm:inline">
-              {format(timelineDates[0], 'yyyy/MM/dd')} - {format(timelineDates[timelineDates.length - 1], 'MM/dd')}
+              {language === 'fr'
+                ? `${format(timelineDates[0], 'dd/MM/yyyy')} - ${format(timelineDates[timelineDates.length - 1], 'dd/MM')}`
+                : language === 'en'
+                  ? `${format(timelineDates[0], 'MM/dd/yyyy')} - ${format(timelineDates[timelineDates.length - 1], 'MM/dd')}`
+                  : `${format(timelineDates[0], 'yyyy/MM/dd')} - ${format(timelineDates[timelineDates.length - 1], 'MM/dd')}`}
             </span>
           )}
         </div>
@@ -2365,8 +2371,15 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
             <div className="flex flex-1 min-w-max" style={{ width: `${totalGridWidth}px` }}>
               {timelineDates.map(date => {
                 const today = isToday(date);
-                const dayOfWeek = format(date, 'EEE');
-                const isWeekend = dayOfWeek === 'Sat' || dayOfWeek === 'Sun';
+                const dayIdx = date.getDay();
+                const isWeekend = dayIdx === 0 || dayIdx === 6;
+                const dayOfWeek =
+                  language === 'ja'
+                    ? ['日', '月', '火', '水', '木', '金', '土'][dayIdx]
+                    : language === 'fr'
+                      ? ['Dim', 'Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'][dayIdx]
+                      : ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dayIdx];
+                const formattedMonthDay = format(date, language === 'fr' ? 'd/M' : 'M/d');
                 const dayWidth = slotsPerDay * slotWidth;
 
                 return (
@@ -2390,7 +2403,10 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                       "px-2 flex items-center justify-between border-b border-slate-200/70",
                       isFullscreen ? "py-0.5" : "py-1"
                     )}>
-                      <span className="text-[10px] uppercase font-bold text-slate-400 leading-none">
+                      <span className={cn(
+                        "text-[10px] uppercase font-bold leading-none",
+                        dayIdx === 0 ? "text-red-400" : dayIdx === 6 ? "text-indigo-400" : "text-slate-400"
+                      )}>
                         {dayOfWeek}
                       </span>
                       <span className={cn(
@@ -2398,7 +2414,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                         isFullscreen ? "text-[11px] py-0" : "text-xs py-0.5",
                         today ? "bg-indigo-600 text-white" : "text-slate-700"
                       )}>
-                        {format(date, 'M/d')}
+                        {formattedMonthDay}
                       </span>
                     </div>
 
@@ -2771,9 +2787,9 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                           {!fDeadlineAlert && fMeta?.deadline && (
                             <span
                               className="text-[9px] px-1 py-0.2 rounded font-mono text-slate-400 font-normal shrink-0 leading-none"
-                              title={format(new Date(fMeta.deadline), 'yyyy/MM/dd HH:mm')}
+                              title={format(new Date(fMeta.deadline), language === 'fr' ? 'dd/MM/yyyy HH:mm' : language === 'en' ? 'MM/dd/yyyy HH:mm' : 'yyyy/MM/dd HH:mm')}
                             >
-                              {format(new Date(fMeta.deadline), 'M/d')}
+                              {format(new Date(fMeta.deadline), language === 'fr' ? 'd/M' : 'M/d')}
                             </span>
                           )}
                         </div>
@@ -2984,7 +3000,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                                         isDragOver && "bg-indigo-100 border-2 border-dashed border-indigo-500",
                                         "hover:bg-indigo-50/30"
                                       )}
-                                      title={L(`${format(new Date(slotStartMs), 'M/d HH:mm')} - ダブルクリックでタスク追加`, `${format(new Date(slotStartMs), 'M/d HH:mm')} - Double-click to add task`, `${format(new Date(slotStartMs), 'M/d HH:mm')} - Double-cliquez pour ajouter une tâche`)}
+                                      title={L(`${format(new Date(slotStartMs), 'M/d HH:mm')} - ダブルクリックでタスク追加`, `${format(new Date(slotStartMs), 'M/d HH:mm')} - Double-click to add task`, `${format(new Date(slotStartMs), 'd/M HH:mm')} - Double-cliquez pour ajouter une tâche`)}
                                     />
                                   );
                                 })}
@@ -3292,6 +3308,38 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
             <span>{L('全画面', 'Fullscreen', 'Plein écran')}</span>
           </button>
         )
+      )}
+
+      {/* Floating Circular Add Task Button (Bottom-Right of Timeline on PC & Mobile) */}
+      {onOpenCreateTaskModal && (
+        <button
+          type="button"
+          onClick={() => {
+            const activeTaskObj = activeTaskId && !activeTaskId.startsWith('folder:')
+              ? tasks.find(t => t.id === activeTaskId)
+              : null;
+            const folderFromActiveTab = activeTaskId?.startsWith('folder:')
+              ? activeTaskId.slice(7)
+              : '';
+            const targetFolder =
+              selectedFolderPath ||
+              (selectedKey?.startsWith('folder:') ? selectedKey.slice(7) : '') ||
+              folderFromActiveTab ||
+              activeTaskObj?.project ||
+              'General';
+            onOpenCreateTaskModal(targetFolder);
+          }}
+          className={cn(
+            "w-12 h-12 rounded-full bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white shadow-xl shadow-indigo-600/30 border border-indigo-400/30 flex items-center justify-center transition-all cursor-pointer select-none",
+            isFullscreen
+              ? "fixed bottom-13 right-3.5 z-[95]"
+              : "fixed bottom-29 right-3.5 z-[66] lg:absolute lg:bottom-4 lg:right-4 lg:z-40"
+          )}
+          title={L('新規タスクを追加', 'Add New Task', 'Ajouter une nouvelle tâche')}
+          aria-label={L('新規タスクを追加', 'Add New Task', 'Ajouter une nouvelle tâche')}
+        >
+          <Plus size={22} strokeWidth={2.5} />
+        </button>
       )}
 
       {/* Folder Creation Modal */}
