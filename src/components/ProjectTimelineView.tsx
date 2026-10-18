@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { 
   ChevronLeft, 
   ChevronRight, 
@@ -44,6 +45,9 @@ import { Task, Category, FolderMeta } from '../types';
 import { cn, tr } from '../lib/utils';
 import { format, addDays, subDays, startOfDay, isSameDay, isToday, isTomorrow, differenceInCalendarDays } from 'date-fns';
 import { isTaskOccurringOnDate } from '../lib/taskDateUtils';
+import { db } from '../lib/firebase';
+import { doc, setDoc, onSnapshot, query, collection, where } from 'firebase/firestore';
+import { User } from 'firebase/auth';
 
 export interface CustomTimelineColumn {
   id: string;
@@ -121,28 +125,58 @@ export const getTaskCurrentStep = (
   return 0;
 };
 
+// Helper to determine if a task has an all-day deadline or is all-day
+export const isTaskAllDayDeadline = (task: { deadline?: number; startDate?: number; isAllDay?: boolean } | null | undefined): boolean => {
+  if (!task) return false;
+  if (task.isAllDay) return true;
+  if (typeof task.deadline === 'number') {
+    const d = new Date(task.deadline);
+    if (d.getHours() === 23 && d.getMinutes() >= 59) return true;
+    if (d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0) return true;
+    if (d.getHours() === 18 && d.getMinutes() === 0 && d.getSeconds() === 0) return true;
+  }
+  return false;
+};
+
 // Helper for approaching or overdue deadline alerts
-export const getTaskDeadlineAlert = (deadline?: number, isDone?: boolean, language: string = 'ja') => {
+export const getTaskDeadlineAlert = (deadline?: number, isDone?: boolean, language: string = 'ja', taskIsAllDay?: boolean) => {
   if (!deadline || isDone) return null;
   const now = Date.now();
   const targetDate = new Date(deadline);
-  const isOverdue = deadline < now;
   const isTargetToday = isToday(targetDate);
   const isTargetTomorrow = isTomorrow(targetDate);
   const daysDiff = differenceInCalendarDays(targetDate, new Date());
+  const isAllDay = taskIsAllDay ?? isTaskAllDayDeadline({ deadline });
+
+  // For all-day tasks on today, they are due until 23:59:59 of today, so they are NEVER overdue while it's still today
+  if (isTargetToday && isAllDay) {
+    return {
+      isOverdue: false,
+      label: tr(language, '本日', 'Today', 'Auj.'),
+      tooltip: tr(language, '本日締切 (終日)', 'Due today (All day)', "Échéance aujourd'hui (Toute la journée)")
+    };
+  }
+
+  const effectiveDeadline = (isAllDay && isTargetToday)
+    ? new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate(), 23, 59, 59, 999).getTime()
+    : deadline;
+
+  const isOverdue = effectiveDeadline < now;
 
   if (isOverdue) {
     return {
       isOverdue: true,
       label: tr(language, '期限切', 'Overdue', 'Retard'),
-      tooltip: tr(language, `期限切れ: ${format(targetDate, 'yyyy/MM/dd HH:mm')}`, `Overdue: ${format(targetDate, 'MM/dd/yyyy HH:mm')}`, `En retard : ${format(targetDate, 'dd/MM/yyyy HH:mm')}`)
+      tooltip: tr(language, `期限切れ: ${format(targetDate, isAllDay ? 'yyyy/MM/dd' : 'yyyy/MM/dd HH:mm')}`, `Overdue: ${format(targetDate, isAllDay ? 'MM/dd/yyyy' : 'MM/dd/yyyy HH:mm')}`, `En retard : ${format(targetDate, isAllDay ? 'dd/MM/yyyy' : 'dd/MM/yyyy HH:mm')}`)
     };
   }
   if (isTargetToday) {
     return {
       isOverdue: false,
       label: tr(language, '本日', 'Today', 'Auj.'),
-      tooltip: tr(language, `本日締切: ${format(targetDate, 'HH:mm')}`, `Due today: ${format(targetDate, 'HH:mm')}`, `Échéance aujourd'hui : ${format(targetDate, 'HH:mm')}`)
+      tooltip: isAllDay 
+        ? tr(language, '本日締切 (終日)', 'Due today (All day)', "Échéance aujourd'hui (Toute la journée)")
+        : tr(language, `本日締切: ${format(targetDate, 'HH:mm')}`, `Due today: ${format(targetDate, 'HH:mm')}`, `Échéance aujourd'hui : ${format(targetDate, 'HH:mm')}`)
     };
   }
   if (isTargetTomorrow) {
@@ -193,12 +227,16 @@ interface ProjectTimelineViewProps {
   activeSection?: string;
   language?: string;
   folderMetas?: Record<string, FolderMeta>;
-  onUpdateFolderMeta?: (folderPath: string, updates: Partial<FolderMeta>) => void;
+  onUpdateFolderMeta?: (folderPath: string, updates: Partial<FolderMeta>, options?: { skipHistory?: boolean }) => void;
   onToggleFolderStar?: (folderPath: string) => void;
   onToggleFolderPin?: (folderPath: string) => void;
   isFullscreen?: boolean;
   onToggleFullscreen?: () => void;
   onOpenCreateTaskModal?: (defaultProject?: string) => void;
+  phasePatterns?: PhasePattern[];
+  activePatternId?: string;
+  onSavePhasePatterns?: (section: string, patterns: PhasePattern[], activePatternId?: string) => Promise<void> | void;
+  user?: User | null;
   t: (key: string) => string;
 }
 
@@ -230,6 +268,10 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
   isFullscreen = false,
   onToggleFullscreen,
   onOpenCreateTaskModal,
+  phasePatterns: propPhasePatterns,
+  activePatternId: propActivePatternId,
+  onSavePhasePatterns,
+  user,
   t
 }) => {
   const L = (ja: string, en: string, fr: string) => tr(language, ja, en, fr);
@@ -252,8 +294,9 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     }
   };
 
-  // Phase Patterns State (Multiple named variations with distinct columns & task assignments)
-  const [phasePatterns, setPhasePatterns] = useState<PhasePattern[]>(() => {
+  // Phase Patterns State (Prop-driven from App.tsx settings with local storage fallback)
+  const [localPhasePatterns, setLocalPhasePatterns] = useState<PhasePattern[]>(() => {
+    if (propPhasePatterns && propPhasePatterns.length > 0) return propPhasePatterns;
     try {
       const saved = localStorage.getItem(`navfor_phase_patterns_${activeSection}`);
       if (saved) {
@@ -297,13 +340,93 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     }
   });
 
-  const [activePatternId, setActivePatternId] = useState<string>(() => {
+  const [localActivePatternId, setLocalActivePatternId] = useState<string>(() => {
+    if (propActivePatternId) return propActivePatternId;
     try {
       const saved = localStorage.getItem(`navfor_active_phase_pattern_${activeSection}`);
       if (saved) return saved;
     } catch (e) {}
     return DEFAULT_PATTERN_ID;
   });
+
+  // Effective state: merge prop from App.tsx, local state, and localStorage so user patterns are NEVER lost or overwritten
+  const phasePatterns = useMemo(() => {
+    const map = new Map<string, PhasePattern>();
+    // 1. Local state (including Firestore real-time listener updates)
+    if (Array.isArray(localPhasePatterns)) {
+      localPhasePatterns.forEach(p => {
+        if (p && p.id) map.set(p.id, p);
+      });
+    }
+    // 2. Prop from App.tsx
+    if (propPhasePatterns && Array.isArray(propPhasePatterns)) {
+      propPhasePatterns.forEach(p => {
+        if (p && p.id) {
+          const existing = map.get(p.id);
+          if (!existing || (p.updatedAt && (!existing.updatedAt || p.updatedAt >= existing.updatedAt))) {
+            map.set(p.id, p);
+          }
+        }
+      });
+    }
+    // 3. Fallback from localStorage (all sections across user account)
+    try {
+      const keys = Object.keys(localStorage).filter(k => k.startsWith('navfor_phase_patterns_'));
+      keys.forEach(k => {
+        const saved = localStorage.getItem(k);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed)) {
+            parsed.forEach((p: PhasePattern) => {
+              if (p && p.id && !map.has(p.id)) {
+                map.set(p.id, p);
+              }
+            });
+          }
+        }
+      });
+    } catch {}
+
+    const result = Array.from(map.values());
+    return result.length > 0 ? result : [
+      {
+        id: DEFAULT_PATTERN_ID,
+        name: language === 'ja' ? 'デフォルト' : language === 'fr' ? 'Par défaut' : 'Default',
+        columns: DEFAULT_CUSTOM_COLUMNS,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      }
+    ];
+  }, [localPhasePatterns, propPhasePatterns, activeSection, language]);
+
+  const activePatternId = useMemo(() => {
+    if (propActivePatternId && phasePatterns.some(p => p.id === propActivePatternId)) {
+      return propActivePatternId;
+    }
+    if (localActivePatternId && phasePatterns.some(p => p.id === localActivePatternId)) {
+      return localActivePatternId;
+    }
+    return phasePatterns[0]?.id || DEFAULT_PATTERN_ID;
+  }, [propActivePatternId, localActivePatternId, phasePatterns]);
+
+  // Keep local state in sync when cloud props change without dropping custom patterns
+  useEffect(() => {
+    if (propPhasePatterns && propPhasePatterns.length > 0) {
+      setLocalPhasePatterns(prev => {
+        const map = new Map<string, PhasePattern>();
+        prev.forEach(p => map.set(p.id, p));
+        propPhasePatterns.forEach(p => map.set(p.id, p));
+        const merged = Array.from(map.values());
+        try {
+          localStorage.setItem(`navfor_phase_patterns_${activeSection}`, JSON.stringify(merged));
+          if (propActivePatternId) {
+            localStorage.setItem(`navfor_active_phase_pattern_${activeSection}`, propActivePatternId);
+          }
+        } catch {}
+        return merged;
+      });
+    }
+  }, [propPhasePatterns, propActivePatternId, activeSection]);
 
   // Re-sync patterns and active pattern when activeSection changes or external update occurs
   const syncPatterns = useCallback(() => {
@@ -312,12 +435,17 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          setPhasePatterns(parsed);
+          setLocalPhasePatterns(prev => {
+            const map = new Map<string, PhasePattern>();
+            prev.forEach(p => map.set(p.id, p));
+            parsed.forEach((p: PhasePattern) => map.set(p.id, p));
+            return Array.from(map.values());
+          });
         }
       }
       const savedActive = localStorage.getItem(`navfor_active_phase_pattern_${activeSection}`);
       if (savedActive) {
-        setActivePatternId(savedActive);
+        setLocalActivePatternId(savedActive);
       }
     } catch (e) {
       console.error(e);
@@ -329,6 +457,102 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     window.addEventListener('navfor_phase_patterns_updated', syncPatterns);
     return () => window.removeEventListener('navfor_phase_patterns_updated', syncPatterns);
   }, [syncPatterns]);
+
+  // Helper for safe Firestore Phase Config document ID
+  const getPhaseConfigDocId = useCallback((uid: string, section: string) => {
+    const safeSection = encodeURIComponent(section).replace(/[^a-zA-Z0-9_-]/g, '_') || 'General';
+    return `${uid}_${safeSection}`;
+  }, []);
+
+  // Real-time Cloud Synchronization of Phase Patterns per user account & section across devices
+  useEffect(() => {
+    if (!user?.uid) return;
+
+    // Listen to all phase configs belonging to this user account
+    const q = query(collection(db, 'phase_configs'), where('userId', '==', user.uid));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      let currentSectionDoc: any = null;
+      const allUserPatternsMap = new Map<string, PhasePattern>();
+
+      snapshot.forEach(docSnap => {
+        const data = docSnap.data();
+        if (data.userId === user.uid && Array.isArray(data.patterns)) {
+          if (data.section === activeSection) {
+            currentSectionDoc = data;
+          }
+          data.patterns.forEach((p: PhasePattern) => {
+            if (p && p.id) {
+              const existing = allUserPatternsMap.get(p.id);
+              if (!existing || (p.updatedAt && (!existing.updatedAt || p.updatedAt >= existing.updatedAt))) {
+                allUserPatternsMap.set(p.id, p);
+              }
+            }
+          });
+        }
+      });
+
+      // Get current local patterns from storage
+      const localRaw = localStorage.getItem(`navfor_phase_patterns_${activeSection}`);
+      let localParsed: PhasePattern[] = [];
+      try { if (localRaw) localParsed = JSON.parse(localRaw); } catch {}
+
+      const mergedMap = new Map<string, PhasePattern>();
+      // 1. Current section patterns from cloud
+      if (currentSectionDoc && Array.isArray(currentSectionDoc.patterns)) {
+        currentSectionDoc.patterns.forEach((p: PhasePattern) => mergedMap.set(p.id, p));
+      }
+      // 2. Local patterns
+      if (Array.isArray(localParsed)) {
+        localParsed.forEach((p: PhasePattern) => {
+          if (!mergedMap.has(p.id)) mergedMap.set(p.id, p);
+        });
+      }
+      // 3. User account patterns across all sections
+      allUserPatternsMap.forEach((p: PhasePattern) => {
+        if (!mergedMap.has(p.id)) mergedMap.set(p.id, p);
+      });
+
+      const mergedPatterns = Array.from(mergedMap.values());
+      if (mergedPatterns.length > 0) {
+        setLocalPhasePatterns(mergedPatterns);
+        const targetActive = currentSectionDoc?.activePatternId ||
+          (mergedMap.has(activePatternId) ? activePatternId : mergedPatterns[0]?.id || DEFAULT_PATTERN_ID);
+        setLocalActivePatternId(targetActive);
+
+        try {
+          localStorage.setItem(`navfor_phase_patterns_${activeSection}`, JSON.stringify(mergedPatterns));
+          localStorage.setItem(`navfor_active_phase_pattern_${activeSection}`, targetActive);
+          const current = mergedPatterns.find(p => p.id === targetActive) || mergedPatterns[0];
+          if (current) {
+            localStorage.setItem(`navfor_custom_timeline_cols_${activeSection}`, JSON.stringify(current.columns));
+          }
+        } catch {}
+
+        // If current section cloud doc didn't exist or missed any patterns, sync back to cloud!
+        if (!currentSectionDoc || currentSectionDoc.patterns.length < mergedPatterns.length) {
+          const configDocId = getPhaseConfigDocId(user.uid, activeSection);
+          const configDocRef = doc(db, 'phase_configs', configDocId);
+          setDoc(configDocRef, {
+            userId: user.uid,
+            section: activeSection,
+            activePatternId: targetActive,
+            patterns: mergedPatterns.map(p => ({
+              id: p.id,
+              name: p.name,
+              columns: p.columns || [],
+              createdAt: p.createdAt || Date.now(),
+              updatedAt: p.updatedAt || Date.now()
+            })),
+            updatedAt: Date.now()
+          }, { merge: true }).catch(() => {});
+        }
+      }
+    }, (err) => {
+      console.warn("Phase patterns account sync notice:", err.message);
+    });
+
+    return () => unsubscribe();
+  }, [user?.uid, activeSection, getPhaseConfigDocId]);
 
   // Active pattern resolution
   const activePattern = useMemo<PhasePattern>(() => {
@@ -343,9 +567,9 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
 
   const savePhasePatterns = (patterns: PhasePattern[], newActivePatternId?: string) => {
     const targetActiveId = newActivePatternId || activePatternId;
-    setPhasePatterns(patterns);
+    setLocalPhasePatterns(patterns);
     if (newActivePatternId) {
-      setActivePatternId(newActivePatternId);
+      setLocalActivePatternId(newActivePatternId);
     }
     try {
       localStorage.setItem(`navfor_phase_patterns_${activeSection}`, JSON.stringify(patterns));
@@ -358,10 +582,38 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     } catch (e) {
       console.error(e);
     }
+
+    // Account Cloud Synchronization across devices
+    if (onSavePhasePatterns) {
+      onSavePhasePatterns(activeSection, patterns, targetActiveId);
+    } else if (user?.uid) {
+      try {
+        const configDocId = getPhaseConfigDocId(user.uid, activeSection);
+        const configDocRef = doc(db, 'phase_configs', configDocId);
+        const payload = {
+          userId: user.uid,
+          section: activeSection,
+          activePatternId: targetActiveId,
+          patterns: patterns.map(p => ({
+            id: p.id,
+            name: p.name,
+            columns: p.columns || [],
+            createdAt: p.createdAt || Date.now(),
+            updatedAt: p.updatedAt || Date.now()
+          })),
+          updatedAt: Date.now()
+        };
+        setDoc(configDocRef, payload, { merge: true }).catch(err => {
+          console.warn("Phase config cloud write notice:", err);
+        });
+      } catch (err) {
+        console.warn("Error initiating phase config save to cloud:", err);
+      }
+    }
   };
 
   const handleSelectPattern = (patternId: string) => {
-    setActivePatternId(patternId);
+    setLocalActivePatternId(patternId);
     try {
       localStorage.setItem(`navfor_active_phase_pattern_${activeSection}`, patternId);
       const current = phasePatterns.find(p => p.id === patternId);
@@ -371,6 +623,33 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
       window.dispatchEvent(new Event('navfor_phase_patterns_updated'));
     } catch (e) {
       console.error(e);
+    }
+
+    // Account Cloud Synchronization across devices
+    if (onSavePhasePatterns) {
+      onSavePhasePatterns(activeSection, phasePatterns, patternId);
+    } else if (user?.uid) {
+      try {
+        const configDocId = getPhaseConfigDocId(user.uid, activeSection);
+        const configDocRef = doc(db, 'phase_configs', configDocId);
+        setDoc(configDocRef, {
+          userId: user.uid,
+          section: activeSection,
+          activePatternId: patternId,
+          patterns: phasePatterns.map(p => ({
+            id: p.id,
+            name: p.name,
+            columns: p.columns || [],
+            createdAt: p.createdAt || Date.now(),
+            updatedAt: p.updatedAt || Date.now()
+          })),
+          updatedAt: Date.now()
+        }, { merge: true }).catch(err => {
+          console.warn("Phase active pattern cloud write notice:", err);
+        });
+      } catch (err) {
+        console.warn("Error updating active pattern in cloud:", err);
+      }
     }
   };
 
@@ -423,11 +702,18 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
 
   // Close pattern dropdown on outside click or escape
   useEffect(() => {
-    const handleOutside = (e: MouseEvent) => {
-      if (patternMenuRef.current && !patternMenuRef.current.contains(e.target as Node)) {
-        setIsPatternMenuOpen(false);
-        setEditingPatternId(null);
+    const handleOutside = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (patternMenuRef.current && patternMenuRef.current.contains(target)) {
+        return;
       }
+      const el = target instanceof Element ? target : target.parentElement;
+      if (el?.closest('[data-dropdown-trigger="pattern"]')) {
+        return;
+      }
+      setIsPatternMenuOpen(false);
+      setEditingPatternId(null);
     };
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -437,9 +723,11 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     };
     if (isPatternMenuOpen) {
       document.addEventListener('mousedown', handleOutside);
+      document.addEventListener('touchstart', handleOutside);
       document.addEventListener('keydown', handleKey);
       return () => {
         document.removeEventListener('mousedown', handleOutside);
+        document.removeEventListener('touchstart', handleOutside);
         document.removeEventListener('keydown', handleKey);
       };
     }
@@ -448,6 +736,8 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
   // Quick Menu (3-line hamburger menu for quick access to all functions)
   const [isQuickMenuOpen, setIsQuickMenuOpen] = useState(false);
   const [quickMenuOrigin, setQuickMenuOrigin] = useState<'toolbar' | 'floating'>('toolbar');
+  const [quickMenuTriggerRect, setQuickMenuTriggerRect] = useState<DOMRect | null>(null);
+  const [patternMenuTriggerRect, setPatternMenuTriggerRect] = useState<DOMRect | null>(null);
   const quickMenuRef = useRef<HTMLDivElement>(null);
 
   // Time Filter State (filter tasks by updatedAt)
@@ -469,6 +759,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
   });
 
   const [isTimeFilterOpen, setIsTimeFilterOpen] = useState(false);
+  const [timeFilterTriggerRect, setTimeFilterTriggerRect] = useState<DOMRect | null>(null);
   const timeFilterMenuRef = useRef<HTMLDivElement>(null);
   const [customAmountInput, setCustomAmountInput] = useState<number>(timeFilter.amount || 2);
   const [customUnitInput, setCustomUnitInput] = useState<TimeFilterUnit>(timeFilter.unit || 'week');
@@ -479,10 +770,17 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
   }, [timeFilter.amount, timeFilter.unit, isTimeFilterOpen]);
 
   useEffect(() => {
-    const handleOutside = (e: MouseEvent) => {
-      if (timeFilterMenuRef.current && !timeFilterMenuRef.current.contains(e.target as Node)) {
-        setIsTimeFilterOpen(false);
+    const handleOutside = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (timeFilterMenuRef.current && timeFilterMenuRef.current.contains(target)) {
+        return;
       }
+      const el = target instanceof Element ? target : target.parentElement;
+      if (el?.closest('[data-dropdown-trigger="time-filter"]')) {
+        return;
+      }
+      setIsTimeFilterOpen(false);
     };
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -491,9 +789,11 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     };
     if (isTimeFilterOpen) {
       document.addEventListener('mousedown', handleOutside);
+      document.addEventListener('touchstart', handleOutside);
       document.addEventListener('keydown', handleKey);
       return () => {
         document.removeEventListener('mousedown', handleOutside);
+        document.removeEventListener('touchstart', handleOutside);
         document.removeEventListener('keydown', handleKey);
       };
     }
@@ -537,10 +837,17 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
   }, [timeFilter.enabled, timeFilter.amount, timeFilter.unit]);
 
   useEffect(() => {
-    const handleOutside = (e: MouseEvent) => {
-      if (quickMenuRef.current && !quickMenuRef.current.contains(e.target as Node)) {
-        setIsQuickMenuOpen(false);
+    const handleOutside = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (quickMenuRef.current && quickMenuRef.current.contains(target)) {
+        return;
       }
+      const el = target instanceof Element ? target : target.parentElement;
+      if (el?.closest('[data-dropdown-trigger="quick-menu"]')) {
+        return;
+      }
+      setIsQuickMenuOpen(false);
     };
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -549,9 +856,11 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     };
     if (isQuickMenuOpen) {
       document.addEventListener('mousedown', handleOutside);
+      document.addEventListener('touchstart', handleOutside);
       document.addEventListener('keydown', handleKey);
       return () => {
         document.removeEventListener('mousedown', handleOutside);
+        document.removeEventListener('touchstart', handleOutside);
         document.removeEventListener('keydown', handleKey);
       };
     }
@@ -1105,17 +1414,129 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     window.addEventListener('touchend', handleEnd);
   };
 
+  // Fine grid calculations for Calendar Mode
+  const effectiveGridStep = isGridEnabled ? gridStepHours : 24;
+  const slotDurationMs = useMemo(() => effectiveGridStep * 3600 * 1000, [effectiveGridStep]);
+  const slotsPerDay = useMemo(() => Math.max(1, Math.round(24 / effectiveGridStep)), [effectiveGridStep]);
+
+  // User adjustable Date columns width (for Dates mode)
+  // Default is 200px when grid is OFF (matching Phase display default of 200px)
+  const defaultDateColWidth = useMemo(() => {
+    if (!isGridEnabled) return 200;
+    if (gridStepHours <= 1) return 30 * 24; // 720
+    if (gridStepHours <= 2) return 38 * 12; // 456
+    if (gridStepHours <= 4) return 46 * 6;  // 276
+    if (gridStepHours <= 6) return 60 * 4;  // 240
+    if (gridStepHours <= 12) return 84 * 2; // 168
+    return 200;
+  }, [isGridEnabled, gridStepHours]);
+
+  const [customDateColWidthOff, setCustomDateColWidthOff] = useState<number | null>(() => {
+    try {
+      const saved = localStorage.getItem('navfor_timeline_date_col_width_off');
+      if (saved) {
+        const parsed = Number(saved);
+        if (!isNaN(parsed) && parsed >= 80) return parsed;
+      }
+    } catch {}
+    return null;
+  });
+
+  const [customDateColWidthOn, setCustomDateColWidthOn] = useState<number | null>(() => {
+    try {
+      const saved = localStorage.getItem('navfor_timeline_date_col_width_on');
+      if (saved) {
+        const parsed = Number(saved);
+        if (!isNaN(parsed) && parsed >= 80) return parsed;
+      }
+    } catch {}
+    return null;
+  });
+
+  const isResizingDateCol = useRef(false);
+  const startDateXRef = useRef(0);
+  const startDateWidthRef = useRef(0);
+
+  const effectiveDateColWidth = useMemo(() => {
+    if (!isGridEnabled) {
+      return customDateColWidthOff ?? 200;
+    }
+    return customDateColWidthOn ?? defaultDateColWidth;
+  }, [isGridEnabled, customDateColWidthOff, customDateColWidthOn, defaultDateColWidth]);
+
+  const slotWidth = useMemo(() => {
+    if (!isGridEnabled) return effectiveDateColWidth;
+    return Math.max(20, Math.round(effectiveDateColWidth / slotsPerDay));
+  }, [isGridEnabled, effectiveDateColWidth, slotsPerDay]);
+
+  const handleStartDateColResize = (clientX: number) => {
+    isResizingDateCol.current = true;
+    startDateXRef.current = clientX;
+    startDateWidthRef.current = effectiveDateColWidth;
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'col-resize';
+
+    const minWidth = !isGridEnabled ? 100 : Math.max(120, slotsPerDay * 20);
+    const maxWidth = !isGridEnabled ? 800 : Math.max(800, slotsPerDay * 80);
+
+    const handleMove = (e: MouseEvent | TouchEvent) => {
+      if (!isResizingDateCol.current) return;
+      const currentX = 'touches' in e ? e.touches[0].clientX : (e as MouseEvent).clientX;
+      const delta = currentX - startDateXRef.current;
+      const newWidth = Math.max(minWidth, Math.min(maxWidth, startDateWidthRef.current + delta));
+
+      if (!isGridEnabled) {
+        setCustomDateColWidthOff(newWidth);
+      } else {
+        setCustomDateColWidthOn(newWidth);
+      }
+    };
+
+    const handleEnd = () => {
+      if (!isResizingDateCol.current) return;
+      isResizingDateCol.current = false;
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleEnd);
+      window.removeEventListener('touchmove', handleMove);
+      window.removeEventListener('touchend', handleEnd);
+      try {
+        if (!isGridEnabled) {
+          setCustomDateColWidthOff(w => {
+            if (w !== null) localStorage.setItem('navfor_timeline_date_col_width_off', String(w));
+            return w;
+          });
+        } else {
+          setCustomDateColWidthOn(w => {
+            if (w !== null) localStorage.setItem('navfor_timeline_date_col_width_on', String(w));
+            return w;
+          });
+        }
+      } catch {}
+    };
+
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleEnd);
+    window.addEventListener('touchmove', handleMove, { passive: false });
+    window.addEventListener('touchend', handleEnd);
+  };
+
   const handleResetColumnWidths = () => {
     const defaultProj = typeof window !== 'undefined' && window.innerWidth < 640 ? 210 : 256;
     setProjectColWidth(defaultProj);
     setFullscreenProjectColWidth(135);
     setTodoColWidth(160);
     setCustomColWidths({});
+    setCustomDateColWidthOff(null);
+    setCustomDateColWidthOn(null);
     try {
       localStorage.removeItem('navfor_timeline_project_col_width');
       localStorage.removeItem('navfor_timeline_fs_project_col_width');
       localStorage.removeItem('navfor_timeline_todo_col_width');
       localStorage.removeItem('navfor_timeline_custom_col_widths');
+      localStorage.removeItem('navfor_timeline_date_col_width_off');
+      localStorage.removeItem('navfor_timeline_date_col_width_on');
     } catch {}
   };
 
@@ -1153,22 +1574,8 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     return dates;
   }, [windowStartDate, daysCount]);
 
-  // Fine grid calculations for Calendar Mode
-  const effectiveGridStep = isGridEnabled ? gridStepHours : 24;
-  const slotDurationMs = useMemo(() => effectiveGridStep * 3600 * 1000, [effectiveGridStep]);
-  const slotsPerDay = useMemo(() => Math.max(1, Math.round(24 / effectiveGridStep)), [effectiveGridStep]);
   const totalSlots = useMemo(() => daysCount * slotsPerDay, [daysCount, slotsPerDay]);
   const timelineStartMs = useMemo(() => startOfDay(windowStartDate).getTime(), [windowStartDate]);
-
-  const slotWidth = useMemo(() => {
-    if (!isGridEnabled) return 130;
-    if (gridStepHours <= 1) return 30;
-    if (gridStepHours <= 2) return 38;
-    if (gridStepHours <= 4) return 46;
-    if (gridStepHours <= 6) return 60;
-    if (gridStepHours <= 12) return 84;
-    return 130;
-  }, [isGridEnabled, gridStepHours]);
 
   const totalGridWidth = useMemo(() => totalSlots * slotWidth, [totalSlots, slotWidth]);
 
@@ -1501,6 +1908,8 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     const items: CandidateItem[] = [];
 
     scheduled.forEach(task => {
+      const allDay = isTaskAllDayDeadline(task) || !isGridEnabled;
+
       if (task.recurrence && task.recurrence.type !== 'none') {
         // Evaluate recurrence across the visible window dates
         for (let d = 0; d < daysCount; d++) {
@@ -1508,7 +1917,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
           if (isTaskOccurringOnDate(task, dayDate, true)) {
             let startMs = dayDate.getTime();
             let endMs = dayDate.getTime() + 86400000;
-            if (!task.isAllDay && (task.startDate || task.deadline)) {
+            if (!allDay && isGridEnabled && (task.startDate || task.deadline)) {
               const refDate = new Date(task.startDate || task.deadline!);
               const hours = refDate.getHours();
               const mins = refDate.getMinutes();
@@ -1530,15 +1939,30 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
         let startMs: number;
         let endMs: number;
 
-        if (hasStart && hasEnd && task.startDate! < task.deadline!) {
-          startMs = task.startDate!;
-          endMs = task.deadline!;
+        if (hasStart && hasEnd && task.startDate! <= task.deadline!) {
+          if (allDay) {
+            startMs = startOfDay(new Date(task.startDate!)).getTime();
+            endMs = startOfDay(new Date(task.deadline!)).getTime() + 86400000;
+          } else {
+            startMs = task.startDate!;
+            endMs = task.deadline!;
+          }
         } else if (hasEnd) {
-          startMs = task.deadline!;
-          endMs = task.deadline!;
+          if (allDay) {
+            startMs = startOfDay(new Date(task.deadline!)).getTime();
+            endMs = startMs + 86400000;
+          } else {
+            startMs = task.deadline!;
+            endMs = task.deadline! + Math.max(slotDurationMs, 3600000);
+          }
         } else if (hasStart) {
-          startMs = task.startDate!;
-          endMs = task.startDate!;
+          if (allDay) {
+            startMs = startOfDay(new Date(task.startDate!)).getTime();
+            endMs = startMs + 86400000;
+          } else {
+            startMs = task.startDate!;
+            endMs = task.startDate! + Math.max(slotDurationMs, 3600000);
+          }
         } else {
           return;
         }
@@ -1554,17 +1978,40 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
 
     items.sort((a, b) => a.startMs - b.startMs || (a.task.order ?? 0) - (b.task.order ?? 0) || a.task.createdAt - b.task.createdAt);
 
+    const dayWidth = slotsPerDay * slotWidth;
+
     items.forEach(({ task, startMs, endMs, occurrenceKey }) => {
       const startSlotIdx = (startMs - timelineStartMs) / slotDurationMs;
       const endSlotIdx = (endMs - timelineStartMs) / slotDurationMs;
 
-      const startPx = Math.max(0, startSlotIdx * slotWidth);
+      // Skip items completely outside visible window
+      if (endSlotIdx <= 0 || startSlotIdx >= totalSlots) {
+        return;
+      }
+
+      const visibleStartSlotIdx = Math.max(0, startSlotIdx);
+      const rawStartPx = visibleStartSlotIdx * slotWidth;
+      const startPx = rawStartPx + 3;
+
       let widthPx: number;
-      if (task.startDate && task.deadline && task.startDate < task.deadline && (!task.recurrence || task.recurrence.type === 'none')) {
-        const spanPx = (endSlotIdx - startSlotIdx) * slotWidth;
-        widthPx = Math.max(120, spanPx);
+      const allDay = isTaskAllDayDeadline(task) || !isGridEnabled;
+      const isMultiDay = Boolean(
+        task.startDate && 
+        task.deadline && 
+        startOfDay(new Date(task.startDate)).getTime() < startOfDay(new Date(task.deadline)).getTime() && 
+        (!task.recurrence || task.recurrence.type === 'none')
+      );
+
+      if (isMultiDay) {
+        const spanSlots = Math.max(1, endSlotIdx - visibleStartSlotIdx);
+        const spanPx = spanSlots * slotWidth;
+        widthPx = Math.max(90, spanPx - 6);
+      } else if (allDay) {
+        widthPx = Math.max(90, dayWidth - 6);
       } else {
-        widthPx = Math.max(130, Math.min(260, slotWidth * 3 - 4));
+        const spanSlots = Math.max(1, endSlotIdx - visibleStartSlotIdx);
+        const spanPx = spanSlots * slotWidth;
+        widthPx = Math.max(90, Math.min(dayWidth - 6, Math.max(spanPx - 6, slotWidth * 2 - 6)));
       }
       const endPx = startPx + widthPx;
 
@@ -1574,8 +2021,8 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
       }
 
       rowEndPx[rowIdx] = endPx;
-      const baseTop = hideSideColumns ? 22 : 6;
-      const rowStep = hideSideColumns ? 32 : 34;
+      const baseTop = hideSideColumns ? 24 : 6;
+      const rowStep = 38;
       const topPx = baseTop + rowIdx * rowStep;
 
       placed.push({
@@ -1589,7 +2036,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
       });
     });
 
-    const laneHeight = Math.max(hideSideColumns ? 54 : 54, (rowEndPx.length || 1) * (hideSideColumns ? 32 : 34) + (hideSideColumns ? 24 : 14));
+    const laneHeight = Math.max(58, (rowEndPx.length || 1) * 38 + (hideSideColumns ? 28 : 16));
     return { placed, laneHeight };
   };
 
@@ -1646,8 +2093,8 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
 
       // Horizontal coordinate calculation
       const startPx = colOffsets[colIdx] + stepIdx * thisSubSlotWidth + 4;
-      // Width of chip: spans comfortably within step slot, minimum 110px
-      const widthPx = Math.max(110, Math.min(thisColWidth - 8, thisSubSlotWidth * 1.5 - 8));
+      // Width of chip: spans comfortably within step slot, minimum 120px
+      const widthPx = Math.max(120, Math.min(thisColWidth - 8, thisSubSlotWidth * 1.5 - 8));
       const endPx = startPx + widthPx;
 
       let rowIdx = 0;
@@ -1656,8 +2103,8 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
       }
 
       rowEndPx[rowIdx] = endPx;
-      const baseTop = hideSideColumns ? 22 : 6;
-      const rowStep = hideSideColumns ? 32 : 34;
+      const baseTop = hideSideColumns ? 24 : 6;
+      const rowStep = 38;
       const topPx = baseTop + rowIdx * rowStep;
 
       placed.push({
@@ -1672,7 +2119,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
       });
     });
 
-    const laneHeight = Math.max(54, (rowEndPx.length || 1) * (hideSideColumns ? 32 : 34) + (hideSideColumns ? 24 : 14));
+    const laneHeight = Math.max(58, (rowEndPx.length || 1) * 38 + (hideSideColumns ? 28 : 16));
     return { placed, laneHeight };
   };
 
@@ -1680,17 +2127,25 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     const data = getDraggedTaskData(e);
     if (!data?.taskId) return;
 
+    let finalDeadline = targetTimeMs;
+    const isAllDay = !isGridEnabled;
+    if (isAllDay) {
+      const d = new Date(targetTimeMs);
+      d.setHours(23, 59, 59, 999);
+      finalDeadline = d.getTime();
+    }
+
     const updates: Partial<Task> = {
       project: projectPath,
-      deadline: targetTimeMs,
-      isAllDay: false
+      deadline: finalDeadline,
+      isAllDay
     };
 
     if (onUpdateTask) {
       onUpdateTask(data.taskId, updates);
     } else {
       if (onMoveTaskFolder) onMoveTaskFolder(data.taskId, projectPath);
-      if (onScheduleTask) onScheduleTask(data.taskId, targetTimeMs);
+      if (onScheduleTask) onScheduleTask(data.taskId, finalDeadline);
     }
     (window as any).__navforDraggingTask = null;
   };
@@ -1741,8 +2196,10 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
       if (timelineMode === 'calendar') {
         scheduled = projectTasks.filter(t => typeof t.deadline === 'number' || typeof t.startDate === 'number' || (t.recurrence && t.recurrence.type !== 'none'))
           .sort((a, b) => {
-            const aTime = a.startDate || a.deadline || 0;
-            const bTime = b.startDate || b.deadline || 0;
+            const aAllDay = isTaskAllDayDeadline(a) || !isGridEnabled;
+            const bAllDay = isTaskAllDayDeadline(b) || !isGridEnabled;
+            const aTime = aAllDay ? startOfDay(new Date(a.startDate || a.deadline || 0)).getTime() : (a.startDate || a.deadline || 0);
+            const bTime = bAllDay ? startOfDay(new Date(b.startDate || b.deadline || 0)).getTime() : (b.startDate || b.deadline || 0);
             return aTime - bTime || (a.order ?? 0) - (b.order ?? 0) || a.createdAt - b.createdAt;
           });
       } else {
@@ -1764,8 +2221,12 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
         ...unscheduled.map((t, idx) => ({ task: t, xApprox: -200 + idx * 10 })),
         ...scheduled.map((t) => {
           let xApprox = 0;
-          if (timelineMode === 'calendar' && t.deadline) {
-            xApprox = (t.deadline - timelineStartMs) / slotDurationMs;
+          if (timelineMode === 'calendar' && (t.deadline || t.startDate)) {
+            const allDay = isTaskAllDayDeadline(t) || !isGridEnabled;
+            const targetTime = allDay
+              ? startOfDay(new Date(t.startDate || t.deadline!)).getTime()
+              : (t.startDate || t.deadline!);
+            xApprox = (targetTime - timelineStartMs) / slotDurationMs;
           } else {
             const colIdx = customColumns.findIndex(c => c.id === getTaskCurrentColumnId(t, customColumns, activePattern.id));
             const stepIdx = getTaskCurrentStep(t, activePattern.id);
@@ -2301,7 +2762,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
       if (slot.type === 'calendar') {
         if (slot.date) {
           const target = new Date(slot.date);
-          target.setHours(18, 0, 0, 0);
+          target.setHours(23, 59, 59, 999);
           updates.deadline = target.getTime();
           updates.isAllDay = true;
           updates.timelineColumn = undefined;
@@ -2492,15 +2953,25 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
         nextPresetSteps[activePattern.id] = cell.stepIdx ?? 0;
       }
 
+      let finalDeadline: number | undefined = undefined;
+      const isAllDayTask = !isGridEnabled;
+      if (cell.type === 'calendar' && cell.dateMs) {
+        const d = new Date(cell.dateMs);
+        if (isAllDayTask) {
+          d.setHours(23, 59, 59, 999);
+        }
+        finalDeadline = d.getTime();
+      }
+
       await onAddTask({
         title,
         project: cell.project,
-        deadline: cell.type === 'calendar' ? cell.dateMs : undefined,
+        deadline: finalDeadline,
         timelineColumn: cell.type === 'custom' && activePattern.id === DEFAULT_PATTERN_ID ? cell.columnId : undefined,
         timelineStep: cell.type === 'custom' && activePattern.id === DEFAULT_PATTERN_ID ? (cell.stepIdx ?? 0) : undefined,
         timelinePresetColumns: cell.type === 'custom' && cell.columnId ? nextPresetCols : undefined,
         timelinePresetSteps: cell.type === 'custom' && cell.columnId ? nextPresetSteps : undefined,
-        isAllDay: true,
+        isAllDay: isAllDayTask,
         order: Date.now() % 10000
       });
     } finally {
@@ -2508,732 +2979,995 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     }
   };
 
-  const renderPatternMenuDropdown = () => (
-    <div 
-      ref={patternMenuRef}
-      className={cn(
-        "w-72 sm:w-80 bg-white border border-slate-200 rounded-xl shadow-2xl z-[100] p-1.5 text-xs select-none animate-in fade-in zoom-in-95 duration-100 text-slate-800",
-        isFullscreen ? "fixed bottom-12 right-2.5" : "absolute left-0 top-full mt-1.5"
-      )}
-    >
-      <div className="px-2.5 py-1.5 border-b border-slate-100 flex items-center justify-between">
-        <div className="flex items-center gap-1.5">
-          <Workflow size={13} className="text-indigo-600" />
-          <span className="font-extrabold text-slate-800 text-[11px]">{L('Phaseパターン一覧', 'Phase Patterns', 'Modèles de phases')}</span>
+  const renderPatternMenuDropdown = () => {
+    if (typeof document === 'undefined') return null;
+
+    const isMobile = typeof window !== 'undefined' && window.innerWidth < 640;
+    let menuStyle: React.CSSProperties = {};
+
+    if (isFullscreen) {
+      menuStyle = {
+        position: 'fixed',
+        bottom: 'calc(4rem + env(safe-area-inset-bottom, 0px))',
+        right: '12px',
+        maxWidth: 'calc(100vw - 24px)',
+        maxHeight: 'calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 6rem)',
+      };
+    } else if (isMobile) {
+      const topPx = patternMenuTriggerRect ? Math.max(8, patternMenuTriggerRect.bottom + 6) : 60;
+      menuStyle = {
+        position: 'fixed',
+        top: `${topPx}px`,
+        left: '10px',
+        right: '10px',
+        maxWidth: 'calc(100vw - 20px)',
+        maxHeight: `calc(100dvh - ${topPx}px - 5.5rem - env(safe-area-inset-bottom, 0px))`,
+      };
+    } else {
+      const topPx = patternMenuTriggerRect ? patternMenuTriggerRect.bottom + 6 : 60;
+      const leftPx = patternMenuTriggerRect ? Math.max(12, patternMenuTriggerRect.left) : 16;
+      menuStyle = {
+        position: 'fixed',
+        top: `${topPx}px`,
+        left: `${leftPx}px`,
+        width: '20rem',
+        maxWidth: 'calc(100vw - 24px)',
+        maxHeight: `min(${Math.max(260, window.innerHeight - topPx - 24)}px, 82vh)`,
+      };
+    }
+
+    return createPortal(
+      <>
+        {/* Backdrop Overlay to ensure smooth touch dismissal and prevent cutoff */}
+        <div 
+          className="fixed inset-0 bg-slate-900/30 sm:bg-slate-900/10 backdrop-blur-2xs z-[120]"
+          onClick={() => setIsPatternMenuOpen(false)}
+        />
+        <div 
+          ref={patternMenuRef}
+          style={menuStyle}
+          className="bg-white border border-slate-200 rounded-2xl shadow-2xl z-[125] p-2 text-xs select-none animate-in fade-in zoom-in-95 duration-100 text-slate-800 overflow-y-auto overscroll-contain custom-scrollbar flex flex-col"
+          onClick={(e) => e.stopPropagation()}
+        >
+        <div className="px-3 py-2 border-b border-slate-100 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Workflow size={15} className="text-indigo-600" />
+            <span className="font-bold text-slate-800 text-xs sm:text-xs">{L('Phaseパターン一覧', 'Phase Patterns', 'Modèles de phases')}</span>
+          </div>
+          <span className="text-[10px] font-mono font-bold text-slate-500 bg-slate-100 px-2 py-0.5 rounded-md">
+            {phasePatterns.length} {L('パターン', 'patterns', 'modèles')}
+          </span>
         </div>
-        <span className="text-[10px] font-mono font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded">
-          {phasePatterns.length} {L('パターン', 'patterns', 'modèles')}
-        </span>
-      </div>
 
-      {/* Pattern Items List */}
-      <div className="py-1 max-h-60 overflow-y-auto space-y-0.5 custom-scrollbar">
-        {phasePatterns.map((p) => {
-          const isActive = p.id === activePattern.id;
-          const isEditing = editingPatternId === p.id;
+        {/* Pattern Items List */}
+        <div className="py-1 max-h-60 overflow-y-auto space-y-1 custom-scrollbar">
+          {phasePatterns.map((p) => {
+            const isActive = p.id === activePattern.id;
+            const isEditing = editingPatternId === p.id;
 
-          if (isEditing) {
-            return (
-              <div key={p.id} className="p-1 bg-indigo-50 rounded-lg flex items-center gap-1">
-                <input
-                  autoFocus
-                  type="text"
-                  value={editingPatternName}
-                  onChange={(e) => setEditingPatternName(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') handleRenamePattern(p.id, editingPatternName);
-                    if (e.key === 'Escape') setEditingPatternId(null);
-                  }}
-                  className="flex-1 bg-white border border-indigo-400 rounded px-2 py-0.5 text-xs font-bold text-slate-800 outline-none"
-                  placeholder={L('パターン名', 'Pattern name', 'Nom du modèle')}
-                />
-                <button
-                  type="button"
-                  onClick={() => handleRenamePattern(p.id, editingPatternName)}
-                  className="p-1 bg-indigo-600 text-white rounded hover:bg-indigo-700 cursor-pointer"
-                  title={L('保存', 'Save', 'Enregistrer')}
-                >
-                  <Check size={12} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setEditingPatternId(null)}
-                  className="p-1 bg-slate-200 text-slate-600 rounded hover:bg-slate-300 cursor-pointer"
-                  title={L('キャンセル', 'Cancel', 'Annuler')}
-                >
-                  <X size={12} />
-                </button>
-              </div>
-            );
-          }
-
-          return (
-            <div
-              key={p.id}
-              onClick={() => {
-                handleSelectPattern(p.id);
-                setIsPatternMenuOpen(false);
-              }}
-              className={cn(
-                "px-2.5 py-1.5 rounded-lg flex items-center justify-between cursor-pointer transition-colors group",
-                isActive ? "bg-indigo-50/90 text-indigo-900 font-bold" : "hover:bg-slate-50 text-slate-700"
-              )}
-            >
-              <div className="flex items-center gap-2 min-w-0 flex-1">
-                <div className={cn(
-                  "w-4 h-4 rounded-full flex items-center justify-center shrink-0 text-[10px]",
-                  isActive ? "bg-indigo-600 text-white shadow-2xs" : "border border-slate-300 group-hover:border-slate-400"
-                )}>
-                  {isActive && <Check size={10} strokeWidth={3} />}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-xs flex items-center gap-1.5">
-                    <span>{p.name}</span>
-                    <span className="text-[9px] font-mono px-1 py-0.2 bg-slate-100 text-slate-500 rounded">
-                      {p.columns.length}{L('列', 'cols', 'cols')}
-                    </span>
-                  </div>
-                  <div className="text-[10px] text-slate-400 font-normal truncate mt-0.5">
-                    {p.columns.map(c => c.label).join(' → ')}
-                  </div>
-                </div>
-              </div>
-
-              {/* Actions on Pattern */}
-              <div 
-                className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity ml-2 shrink-0"
-                onClick={(e) => e.stopPropagation()}
-              >
-                <button
-                  type="button"
-                  onClick={() => {
-                    setEditingPatternId(p.id);
-                    setEditingPatternName(p.name);
-                  }}
-                  className="p-1 text-slate-400 hover:text-indigo-600 hover:bg-indigo-100/50 rounded transition-colors cursor-pointer"
-                  title={L('名前を変更', 'Rename', 'Renommer')}
-                >
-                  <Edit2 size={11} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleDuplicatePattern(p.id)}
-                  className="p-1 text-slate-400 hover:text-indigo-600 hover:bg-indigo-100/50 rounded transition-colors cursor-pointer"
-                  title={L('複製（列と配置タスクをコピー）', 'Duplicate pattern', 'Dupliquer le modèle')}
-                >
-                  <Copy size={11} />
-                </button>
-                {phasePatterns.length > 1 && (
+            if (isEditing) {
+              return (
+                <div key={p.id} className="p-1 bg-indigo-50 rounded-lg flex items-center gap-1">
+                  <input
+                    autoFocus
+                    type="text"
+                    value={editingPatternName}
+                    onChange={(e) => setEditingPatternName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleRenamePattern(p.id, editingPatternName);
+                      if (e.key === 'Escape') setEditingPatternId(null);
+                    }}
+                    className="flex-1 bg-white border border-indigo-400 rounded px-2 py-1 text-xs font-bold text-slate-800 outline-none"
+                    placeholder={L('パターン名', 'Pattern name', 'Nom du modèle')}
+                  />
                   <button
                     type="button"
-                    onClick={() => handleDeletePattern(p.id)}
-                    className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors cursor-pointer"
-                    title={L('削除', 'Delete', 'Supprimer')}
+                    onClick={() => handleRenamePattern(p.id, editingPatternName)}
+                    className="p-1.5 bg-indigo-600 text-white rounded hover:bg-indigo-700 cursor-pointer"
+                    title={L('保存', 'Save', 'Enregistrer')}
                   >
-                    <Trash2 size={11} />
+                    <Check size={14} />
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditingPatternId(null)}
+                    className="p-1.5 bg-slate-200 text-slate-600 rounded hover:bg-slate-300 cursor-pointer"
+                    title={L('キャンセル', 'Cancel', 'Annuler')}
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              );
+            }
+
+            return (
+              <div
+                key={p.id}
+                onClick={() => {
+                  handleSelectPattern(p.id);
+                  setIsPatternMenuOpen(false);
+                }}
+                className={cn(
+                  "px-3 py-2 rounded-xl flex items-center justify-between cursor-pointer transition-colors group min-h-[40px]",
+                  isActive ? "bg-indigo-50/90 text-indigo-900 font-bold" : "hover:bg-slate-50 text-slate-700"
                 )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Pattern Quick Tools & Create New */}
-      <div className="pt-1.5 mt-1 border-t border-slate-100 space-y-1">
-        <button
-          type="button"
-          onClick={() => {
-            setNewPatternName(`${L('パターン', 'Pattern', 'Modèle')} ${phasePatterns.length + 1}`);
-            setNewPatternCopyCols(true);
-            setNewPatternCopyTasks(false);
-            setIsCreatePatternModalOpen(true);
-            setIsPatternMenuOpen(false);
-          }}
-          className="w-full py-1.5 px-2 bg-indigo-50 hover:bg-indigo-100/80 text-indigo-700 font-bold rounded-lg transition-colors flex items-center justify-center gap-1.5 text-xs cursor-pointer"
-        >
-          <Plus size={13} />
-          <span>{L('新規パターンを追加', 'Add New Pattern', 'Nouveau modèle')}</span>
-        </button>
-
-        <div className="flex items-center gap-1 pt-0.5">
-          <button
-            type="button"
-            onClick={() => {
-              handleAddColumn();
-              setIsPatternMenuOpen(false);
-            }}
-            className="flex-1 py-1 px-2 text-[10px] bg-slate-50 hover:bg-slate-100 text-slate-700 font-medium rounded-md flex items-center justify-center gap-1 transition-colors cursor-pointer"
-            title={L(`「${activePattern.name}」に列を追加`, `Add column to "${activePattern.name}"`, `Ajouter une colonne`)}
-          >
-            <Plus size={11} className="text-slate-500" />
-            <span>{L('列を追加', 'Add Col', 'Ajouter col')}</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              handleResetCustomColumns('names_only');
-              setIsPatternMenuOpen(false);
-            }}
-            className="flex-1 py-1 px-2 text-[10px] bg-slate-50 hover:bg-slate-100 text-slate-700 font-medium rounded-md flex items-center justify-center gap-1 transition-colors cursor-pointer"
-            title={L(`「${activePattern.name}」のPhase列名をPhase 1, 2, 3...に再設定`, `Reset column names to Phase 1, 2, 3...`, `Réinitialiser les phases`)}
-          >
-            <RefreshCw size={11} className="text-slate-500" />
-            <span>{L('Reset Phases', 'Reset Phases', 'Réinit. phases')}</span>
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-
-  const renderQuickMenuDropdown = (origin: 'toolbar' | 'floating') => (
-    <div
-      ref={quickMenuRef}
-      className={cn(
-        "w-64 sm:w-72 bg-white border border-slate-200 rounded-xl shadow-2xl z-[100] p-1.5 text-xs text-slate-800 select-none animate-in fade-in zoom-in-95 duration-100 max-h-[82vh] overflow-y-auto custom-scrollbar",
-        origin === 'floating'
-          ? "fixed bottom-12 right-2.5"
-          : "absolute right-0 top-full mt-1.5"
-      )}
-      onClick={(e) => e.stopPropagation()}
-    >
-      <div className="flex items-center justify-between px-2.5 py-1.5 border-b border-slate-100 font-bold text-slate-700">
-        <span className="flex items-center gap-1.5 text-xs">
-          <Menu size={13} className="text-indigo-600" />
-          <span>{L('タイムライン メニュー', 'Timeline Menu', 'Menu chronologie')}</span>
-        </span>
-        <button
-          type="button"
-          onClick={() => setIsQuickMenuOpen(false)}
-          className="p-1 text-slate-400 hover:text-slate-600 rounded hover:bg-slate-100 transition-colors cursor-pointer"
-        >
-          <X size={12} />
-        </button>
-      </div>
-
-      {/* Mode Switcher */}
-      <div className="px-2 pt-2 pb-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-        {L('表示モード', 'View Mode', 'Mode d\'affichage')}
-      </div>
-      <div className="space-y-0.5">
-        <button
-          type="button"
-          onClick={() => {
-            handleSetTimelineMode('calendar');
-            setIsQuickMenuOpen(false);
-          }}
-          className={cn(
-            "w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-left transition-colors cursor-pointer",
-            timelineMode === 'calendar' ? "bg-indigo-50 text-indigo-700 font-bold" : "hover:bg-slate-100 text-slate-700"
-          )}
-        >
-          <span className="flex items-center gap-2">
-            <CalendarIcon size={13} className="text-indigo-600 shrink-0" />
-            <span>{L('日付基準（カレンダー）', 'Calendar Dates', 'Dates du calendrier')}</span>
-          </span>
-          {timelineMode === 'calendar' && <Check size={13} className="text-indigo-600 shrink-0" />}
-        </button>
-
-        <button
-          type="button"
-          onClick={() => {
-            handleSetTimelineMode('custom');
-            setIsQuickMenuOpen(false);
-          }}
-          className={cn(
-            "w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-left transition-colors cursor-pointer",
-            timelineMode === 'custom' ? "bg-indigo-50 text-indigo-700 font-bold" : "hover:bg-slate-100 text-slate-700"
-          )}
-        >
-          <span className="flex items-center gap-2">
-            <SlidersHorizontal size={13} className="text-indigo-600 shrink-0" />
-            <span>{L('カスタム期間・Phase', 'Custom Stages (Phase)', 'Étapes personnalisées')}</span>
-          </span>
-          {timelineMode === 'custom' && <Check size={13} className="text-indigo-600 shrink-0" />}
-        </button>
-      </div>
-
-      {/* Mode-Specific Sub-Controls */}
-      {timelineMode === 'calendar' ? (
-        <div className="mt-1 px-2 py-1.5 bg-slate-50 rounded-lg space-y-1.5 border border-slate-100">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-slate-500 font-semibold">{L('日付移動', 'Navigate', 'Naviguer')}:</span>
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={() => handleNavigate('prev')}
-                className="px-1.5 py-0.5 text-[10px] bg-white border border-slate-200 rounded hover:bg-slate-100 text-slate-700 font-medium"
-                title={L('1週間前へ', 'Previous week', 'Semaine précédente')}
               >
-                ◀ {L('前週', 'Prev', 'Préc.')}
-              </button>
-              <button
-                type="button"
-                onClick={() => handleNavigate('today')}
-                className="px-1.5 py-0.5 text-[10px] font-bold bg-indigo-50 border border-indigo-200 rounded text-indigo-600 hover:bg-indigo-100"
-              >
-                {L('今日', 'Today', 'Auj.')}
-              </button>
-              <button
-                type="button"
-                onClick={() => handleNavigate('next')}
-                className="px-1.5 py-0.5 text-[10px] bg-white border border-slate-200 rounded hover:bg-slate-100 text-slate-700 font-medium"
-                title={L('1週間後へ', 'Next week', 'Semaine suivante')}
-              >
-                {L('翌週', 'Next', 'Suiv.')} ▶
-              </button>
-            </div>
-          </div>
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-slate-500 font-semibold">{L('表示日数', 'Days range', 'Jours')}:</span>
-            <div className="flex items-center gap-1">
-              {[7, 14, 21].map(d => (
-                <button
-                  key={d}
-                  type="button"
-                  onClick={() => setDaysCount(d)}
-                  className={cn(
-                    "px-1.5 py-0.5 text-[10px] rounded border transition-all",
-                    daysCount === d ? "bg-indigo-600 text-white border-indigo-600 font-bold" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
-                  )}
+                <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                  <div className={cn(
+                    "w-5 h-5 rounded-full flex items-center justify-center shrink-0 text-xs",
+                    isActive ? "bg-indigo-600 text-white shadow-2xs" : "border border-slate-300 group-hover:border-slate-400"
+                  )}>
+                    {isActive && <Check size={12} strokeWidth={3} />}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-xs font-semibold flex items-center gap-1.5">
+                      <span>{p.name}</span>
+                      <span className="text-[10px] font-mono px-1.5 py-0.2 bg-slate-100 text-slate-500 rounded">
+                        {p.columns.length}{L('列', 'cols', 'cols')}
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-slate-400 font-normal truncate mt-0.5">
+                      {p.columns.map(c => c.label).join(' → ')}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Actions on Pattern */}
+                <div 
+                  className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity ml-2 shrink-0"
+                  onClick={(e) => e.stopPropagation()}
                 >
-                  {d}{L('日', 'd', 'j')}
-                </button>
-              ))}
-            </div>
-          </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingPatternId(p.id);
+                      setEditingPatternName(p.name);
+                    }}
+                    className="p-1 text-slate-400 hover:text-indigo-600 hover:bg-indigo-100/50 rounded transition-colors cursor-pointer"
+                    title={L('名前を変更', 'Rename', 'Renommer')}
+                  >
+                    <Edit2 size={11} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDuplicatePattern(p.id)}
+                    className="p-1 text-slate-400 hover:text-indigo-600 hover:bg-indigo-100/50 rounded transition-colors cursor-pointer"
+                    title={L('複製（列と配置タスクをコピー）', 'Duplicate pattern', 'Dupliquer le modèle')}
+                  >
+                    <Copy size={11} />
+                  </button>
+                  {phasePatterns.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => handleDeletePattern(p.id)}
+                      className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors cursor-pointer"
+                      title={L('削除', 'Delete', 'Supprimer')}
+                    >
+                      <Trash2 size={11} />
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
-      ) : (
-        <div className="mt-1 px-2 py-1.5 bg-slate-50 rounded-lg space-y-1.5 border border-slate-100">
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-slate-500 font-semibold truncate max-w-[100px]">{L('パターン', 'Pattern', 'Modèle')}:</span>
-            <span className="font-bold text-indigo-700 truncate max-w-[130px]">{activePattern.name}</span>
-          </div>
-          <div className="flex items-center gap-1">
+
+        {/* Pattern Quick Tools & Create New */}
+        <div className="pt-1.5 mt-1 border-t border-slate-100 space-y-1">
+          <button
+            type="button"
+            onClick={() => {
+              setNewPatternName(`${L('パターン', 'Pattern', 'Modèle')} ${phasePatterns.length + 1}`);
+              setNewPatternCopyCols(true);
+              setNewPatternCopyTasks(false);
+              setIsCreatePatternModalOpen(true);
+              setIsPatternMenuOpen(false);
+            }}
+            className="w-full py-2 px-3 bg-indigo-50 hover:bg-indigo-100/80 text-indigo-700 font-bold rounded-xl transition-colors flex items-center justify-center gap-2 text-xs cursor-pointer min-h-[38px]"
+          >
+            <Plus size={15} />
+            <span>{L('新規パターンを追加', 'Add New Pattern', 'Nouveau modèle')}</span>
+          </button>
+
+          <div className="flex items-center gap-1.5 pt-1">
             <button
               type="button"
-              onClick={handleAddColumn}
-              className="flex-1 py-1 px-1.5 text-[10px] bg-white border border-indigo-200 rounded text-indigo-700 hover:bg-indigo-50 font-bold flex items-center justify-center gap-1"
+              onClick={() => {
+                handleAddColumn();
+                setIsPatternMenuOpen(false);
+              }}
+              className="flex-1 py-1.5 px-2 text-xs bg-slate-50 hover:bg-slate-100 text-slate-700 font-medium rounded-lg flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[32px]"
+              title={L(`「${activePattern.name}」に列を追加`, `Add column to "${activePattern.name}"`, `Ajouter une colonne`)}
             >
-              <Plus size={11} />
-              <span>{L('列を追加', 'Add Col', 'Ajouter')}</span>
+              <Plus size={13} className="text-slate-500" />
+              <span>{L('列を追加', 'Add Col', 'Ajouter col')}</span>
             </button>
             <button
               type="button"
-              onClick={() => handleResetCustomColumns('names_only')}
-              className="flex-1 py-1 px-1.5 text-[10px] bg-white border border-slate-200 rounded text-slate-700 hover:bg-slate-100 font-bold flex items-center justify-center gap-1"
-              title={L(`「${activePattern.name}」のPhase列名をデフォルト（Phase 1, 2, 3...）に再設定`, `Reset column names to Phase 1, 2, 3...`, `Réinitialiser les phases`)}
+              onClick={() => {
+                handleResetCustomColumns('names_only');
+                setIsPatternMenuOpen(false);
+              }}
+              className="flex-1 py-1.5 px-2 text-xs bg-slate-50 hover:bg-slate-100 text-slate-700 font-medium rounded-lg flex items-center justify-center gap-1.5 transition-colors cursor-pointer min-h-[32px]"
+              title={L(`「${activePattern.name}」のPhase列名をPhase 1, 2, 3...に再設定`, `Reset column names to Phase 1, 2, 3...`, `Réinitialiser les phases`)}
             >
-              <RefreshCw size={11} />
+              <RefreshCw size={13} className="text-slate-500" />
               <span>{L('Reset Phases', 'Reset Phases', 'Réinit. phases')}</span>
             </button>
           </div>
+          {/* Bottom clearance spacer so the last item is 100% visible and never crowded */}
+          <div className="h-6 sm:h-3 shrink-0" />
         </div>
-      )}
-
-      <div className="h-px bg-slate-100 my-1" />
-
-      {/* Basic Functions */}
-      <div className="px-2 pt-1 pb-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-        {L('基本機能', 'Basic Functions', 'Fonctions de base')}
       </div>
-      <div className="space-y-0.5">
-        {/* Time Filter in Quick Menu */}
-        <button
-          type="button"
-          onClick={() => {
-            setIsQuickMenuOpen(false);
-            setIsTimeFilterOpen(true);
-          }}
-          className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 transition-colors text-left cursor-pointer"
-        >
-          <span className="flex items-center gap-2">
-            <Clock size={13} className={timeFilter.enabled ? "text-indigo-600" : "text-slate-400"} />
-            <span>{L('更新日時フィルター', 'Time Filter (Updated)', 'Filtre de date')}</span>
-          </span>
-          <span className={cn(
-            "text-[9px] px-1.5 py-0.5 rounded font-mono font-bold",
-            timeFilter.enabled ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500"
-          )}>
-            {timeFilter.enabled ? getTimeFilterLabel(timeFilter) : L('すべて', 'All', 'Tous')}
-          </span>
-        </button>
+    </>,
+    document.body
+  );
+};
 
-        {/* Collapse / Expand All */}
-        <button
-          type="button"
-          onClick={() => {
-            handleToggleCollapseAllProjects();
-            setIsQuickMenuOpen(false);
-          }}
-          className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 transition-colors text-left cursor-pointer"
-        >
-          <span className="flex items-center gap-2">
-            {isAllProjectsCollapsed ? (
-              <ChevronsUpDown size={13} className="text-amber-600 shrink-0" />
-            ) : (
-              <ChevronsDownUp size={13} className="text-slate-500 shrink-0" />
-            )}
-            <span>{isAllProjectsCollapsed ? L('全フォルダ展開', 'Expand All Folders', 'Développer tout') : L('全フォルダ折畳', 'Collapse All Folders', 'Tout réduire')}</span>
-          </span>
-        </button>
+  const renderQuickMenuDropdown = (origin: 'toolbar' | 'floating') => {
+    if (typeof document === 'undefined') return null;
 
-        {/* Reset Column Widths */}
-        <button
-          type="button"
-          onClick={() => {
-            handleResetColumnWidths();
-            setIsQuickMenuOpen(false);
-          }}
-          className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 transition-colors text-left cursor-pointer"
-        >
-          <span className="flex items-center gap-2">
-            <ArrowLeftRight size={13} className="text-slate-500 shrink-0" />
-            <span>{L('列幅リセット', 'Reset Column Widths', 'Réinitialiser largeurs')}</span>
-          </span>
-        </button>
+    const isMobile = typeof window !== 'undefined' && window.innerWidth < 640;
+    let menuStyle: React.CSSProperties = {};
 
-        {/* Grid ON / OFF */}
-        <div>
+    if (origin === 'floating') {
+      menuStyle = {
+        position: 'fixed',
+        bottom: 'calc(3.75rem + env(safe-area-inset-bottom, 0px))',
+        right: '12px',
+        width: '20.5rem',
+        maxWidth: 'calc(100vw - 24px)',
+        maxHeight: 'calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 5rem)',
+      };
+    } else if (isMobile) {
+      const topPx = quickMenuTriggerRect ? Math.max(8, quickMenuTriggerRect.bottom + 6) : 56;
+      menuStyle = {
+        position: 'fixed',
+        top: `${topPx}px`,
+        right: '8px',
+        width: 'calc(100vw - 16px)',
+        maxWidth: '22rem',
+        maxHeight: `calc(100dvh - ${topPx}px - 1.25rem - env(safe-area-inset-bottom, 0px))`,
+      };
+    } else {
+      const topPx = quickMenuTriggerRect ? Math.max(8, quickMenuTriggerRect.bottom + 6) : 56;
+      const rightPx = quickMenuTriggerRect ? Math.max(12, window.innerWidth - quickMenuTriggerRect.right) : 16;
+      menuStyle = {
+        position: 'fixed',
+        top: `${topPx}px`,
+        right: `${rightPx}px`,
+        width: '20.5rem',
+        maxWidth: 'calc(100vw - 24px)',
+        maxHeight: `min(${Math.max(260, window.innerHeight - topPx - 20)}px, 85vh)`,
+      };
+    }
+
+    return createPortal(
+      <>
+        {/* Mobile & Desktop Backdrop Overlay to ensure smooth dismissal and prevent background taps */}
+        <div 
+          className="fixed inset-0 bg-slate-900/30 sm:bg-slate-900/10 backdrop-blur-2xs z-[120]"
+          onClick={() => setIsQuickMenuOpen(false)}
+        />
+        <div
+          ref={quickMenuRef}
+          style={menuStyle}
+          className="bg-white border border-slate-200 rounded-2xl shadow-2xl z-[125] p-2 text-xs text-slate-800 select-none animate-in fade-in zoom-in-95 duration-100 overflow-y-auto overscroll-contain custom-scrollbar flex flex-col"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center justify-between px-2.5 py-2 border-b border-slate-100 font-bold text-slate-800 shrink-0">
+            <span className="flex items-center gap-2 text-xs sm:text-xs">
+              <Menu size={15} className="text-indigo-600" />
+              <span>{L('タイムライン メニュー', 'Timeline Menu', 'Menu chronologie')}</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => setIsQuickMenuOpen(false)}
+              className="w-7 h-7 flex items-center justify-center p-1 text-slate-400 hover:text-slate-600 rounded-full hover:bg-slate-100 active:bg-slate-200 transition-colors cursor-pointer"
+            >
+              <X size={15} />
+            </button>
+          </div>
+
+        {/* Mode Switcher */}
+        <div className="px-2 pt-2.5 pb-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+          {L('表示モード', 'View Mode', 'Mode d\'affichage')}
+        </div>
+        <div className="space-y-1">
           <button
             type="button"
             onClick={() => {
-              handleToggleGrid(!isGridEnabled);
+              handleSetTimelineMode('calendar');
+              setIsQuickMenuOpen(false);
+            }}
+            className={cn(
+              "w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition-colors cursor-pointer min-h-[38px]",
+              timelineMode === 'calendar' ? "bg-indigo-50 text-indigo-700 font-bold" : "hover:bg-slate-100 text-slate-700"
+            )}
+          >
+            <span className="flex items-center gap-2.5">
+              <CalendarIcon size={16} className="text-indigo-600 shrink-0" />
+              <span className="text-xs">{L('日付基準（カレンダー）', 'Calendar Dates', 'Dates du calendrier')}</span>
+            </span>
+            {timelineMode === 'calendar' && <Check size={16} className="text-indigo-600 shrink-0" />}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              handleSetTimelineMode('custom');
+              setIsQuickMenuOpen(false);
+            }}
+            className={cn(
+              "w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition-colors cursor-pointer min-h-[38px]",
+              timelineMode === 'custom' ? "bg-indigo-50 text-indigo-700 font-bold" : "hover:bg-slate-100 text-slate-700"
+            )}
+          >
+            <span className="flex items-center gap-2.5">
+              <SlidersHorizontal size={16} className="text-indigo-600 shrink-0" />
+              <span className="text-xs">{L('カスタム期間・Phase', 'Custom Stages (Phase)', 'Étapes personnalisées')}</span>
+            </span>
+            {timelineMode === 'custom' && <Check size={16} className="text-indigo-600 shrink-0" />}
+          </button>
+        </div>
+
+        {/* Mode-Specific Sub-Controls */}
+        {timelineMode === 'calendar' ? (
+          <div className="mt-1 px-2.5 py-2 bg-slate-50 rounded-xl space-y-2 border border-slate-100">
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-slate-500 font-semibold">{L('日付移動', 'Navigate', 'Naviguer')}:</span>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => handleNavigate('prev')}
+                  className="px-2 py-1 text-xs bg-white border border-slate-200 rounded-lg hover:bg-slate-100 text-slate-700 font-medium min-h-[28px] cursor-pointer"
+                  title={L('1週間前へ', 'Previous week', 'Semaine précédente')}
+                >
+                  ◀ {L('前週', 'Prev', 'Préc.')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleNavigate('today')}
+                  className="px-2.5 py-1 text-xs font-bold bg-indigo-50 border border-indigo-200 rounded-lg text-indigo-600 hover:bg-indigo-100 min-h-[28px] cursor-pointer"
+                >
+                  {L('今日', 'Today', 'Auj.')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleNavigate('next')}
+                  className="px-2 py-1 text-xs bg-white border border-slate-200 rounded-lg hover:bg-slate-100 text-slate-700 font-medium min-h-[28px] cursor-pointer"
+                  title={L('1週間後へ', 'Next week', 'Semaine suivante')}
+                >
+                  {L('翌週', 'Next', 'Suiv.')} ▶
+                </button>
+              </div>
+            </div>
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-slate-500 font-semibold">{L('表示日数', 'Days range', 'Jours')}:</span>
+              <div className="flex items-center gap-1">
+                {[7, 14, 21].map(d => (
+                  <button
+                    key={d}
+                    type="button"
+                    onClick={() => setDaysCount(d)}
+                    className={cn(
+                      "px-2.5 py-1 text-xs rounded-lg border transition-all min-h-[28px] cursor-pointer",
+                      daysCount === d ? "bg-indigo-600 text-white border-indigo-600 font-bold" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-100"
+                    )}
+                  >
+                    {d}{L('日', 'd', 'j')}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-1 px-2.5 py-2 bg-slate-50 rounded-xl space-y-2 border border-slate-100">
+            {/* Header: Phase Patterns List & Add New Button */}
+            <div className="flex items-center justify-between text-xs pb-1.5 border-b border-slate-200/70">
+              <span className="text-slate-700 font-bold flex items-center gap-1.5">
+                <Workflow size={14} className="text-indigo-600 shrink-0" />
+                <span>{L('Phaseパターン選択', 'Phase Patterns', 'Modèles')}</span>
+                <span className="text-[10px] font-mono px-1.5 py-0.2 bg-indigo-100 text-indigo-800 rounded font-bold">
+                  {phasePatterns.length}
+                </span>
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setNewPatternName(`${L('パターン', 'Pattern', 'Modèle')} ${phasePatterns.length + 1}`);
+                  setNewPatternCopyCols(true);
+                  setNewPatternCopyTasks(false);
+                  setIsCreatePatternModalOpen(true);
+                  setIsQuickMenuOpen(false);
+                }}
+                className="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold flex items-center gap-1 transition-colors cursor-pointer shadow-2xs min-h-[28px]"
+                title={L('新規パターンを作成', 'Create new pattern', 'Nouveau modèle')}
+              >
+                <Plus size={12} />
+                <span>{L('新規作成', 'New', 'Nouveau')}</span>
+              </button>
+            </div>
+
+            {/* List of ALL account-wide phase patterns */}
+            <div className="max-h-48 overflow-y-auto space-y-1 custom-scrollbar py-0.5">
+              {phasePatterns.map(p => {
+                const isActive = p.id === activePattern.id;
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() => {
+                      handleSelectPattern(p.id);
+                    }}
+                    className={cn(
+                      "w-full px-2.5 py-2 rounded-xl text-left transition-all flex items-center justify-between gap-2 cursor-pointer text-xs min-h-[36px]",
+                      isActive
+                        ? "bg-white text-indigo-900 font-bold border border-indigo-300 shadow-2xs ring-1 ring-indigo-200"
+                        : "bg-white/70 hover:bg-white text-slate-700 border border-slate-200/80 hover:border-slate-300"
+                    )}
+                  >
+                    <div className="flex items-center gap-2 min-w-0 flex-1">
+                      <div className={cn(
+                        "w-4 h-4 rounded-full flex items-center justify-center shrink-0 text-[10px]",
+                        isActive ? "bg-indigo-600 text-white" : "border border-slate-300"
+                      )}>
+                        {isActive && <Check size={10} strokeWidth={3} />}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-xs font-semibold">{p.name}</div>
+                        <div className="text-[10px] text-slate-400 font-normal truncate">
+                          {p.columns.map(c => c.label).join(' → ')}
+                        </div>
+                      </div>
+                    </div>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded shrink-0">
+                      {p.columns.length}{L('列', 'cols', 'cols')}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Sub-tools for active pattern */}
+            <div className="flex items-center gap-1.5 pt-1.5 border-t border-slate-200/70">
+              <button
+                type="button"
+                onClick={handleAddColumn}
+                className="flex-1 py-1.5 px-2 text-xs bg-white border border-indigo-200 rounded-lg text-indigo-700 hover:bg-indigo-50 font-bold flex items-center justify-center gap-1 cursor-pointer shadow-2xs min-h-[30px]"
+                title={L(`「${activePattern.name}」にPhase列を追加`, `Add Phase column to "${activePattern.name}"`, `Ajouter une colonne`)}
+              >
+                <Plus size={13} />
+                <span>{L('列を追加', 'Add Col', 'Ajouter')}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleResetCustomColumns('names_only')}
+                className="flex-1 py-1.5 px-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-700 hover:bg-slate-100 font-bold flex items-center justify-center gap-1 cursor-pointer shadow-2xs min-h-[30px]"
+                title={L(`「${activePattern.name}」のPhase列名をデフォルト（Phase 1, 2, 3...）に再設定`, `Reset column names to Phase 1, 2, 3...`, `Réinitialiser les phases`)}
+              >
+                <RefreshCw size={13} />
+                <span>{L('Reset Phases', 'Reset Phases', 'Réinit.')}</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="h-px bg-slate-100 my-1.5" />
+
+        {/* Basic Functions */}
+        <div className="px-2 pt-1 pb-1 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+          {L('基本機能', 'Basic Functions', 'Fonctions de base')}
+        </div>
+        <div className="space-y-1">
+          {/* Add New Task */}
+          {onOpenCreateTaskModal && (
+            <button
+              type="button"
+              onClick={() => {
+                const activeTaskObj = activeTaskId && !activeTaskId.startsWith('folder:')
+                  ? tasks.find(t => t.id === activeTaskId)
+                  : null;
+                const folderFromActiveTab = activeTaskId?.startsWith('folder:')
+                  ? activeTaskId.slice(7)
+                  : '';
+                const targetFolder =
+                  selectedFolderPath ||
+                  (selectedKey?.startsWith('folder:') ? selectedKey.slice(7) : '') ||
+                  folderFromActiveTab ||
+                  activeTaskObj?.project ||
+                  'General';
+                onOpenCreateTaskModal(targetFolder);
+                setIsQuickMenuOpen(false);
+              }}
+              className="w-full flex items-center justify-between px-3 py-2 rounded-xl hover:bg-indigo-50 text-indigo-700 transition-colors text-left cursor-pointer font-medium min-h-[40px]"
+            >
+              <span className="flex items-center gap-2.5">
+                <Plus size={16} className="text-indigo-600 shrink-0" />
+                <span className="text-xs font-semibold">{L('タスク追加', 'Add New Task', 'Ajouter une tâche')}</span>
+              </span>
+              <span className="text-[11px] text-indigo-500 font-normal">{L('新規作成', 'New Task', 'Nouveau')}</span>
+            </button>
+          )}
+
+          {/* Add Project Folder */}
+          <button
+            type="button"
+            onClick={() => {
+              setTargetParentFolder(null);
+              setNewFolderName('');
+              setIsCreateFolderOpen(true);
+              setIsQuickMenuOpen(false);
+            }}
+            className="w-full flex items-center justify-between px-3 py-2 rounded-xl hover:bg-indigo-50 text-indigo-700 transition-colors text-left cursor-pointer font-medium min-h-[40px]"
+          >
+            <span className="flex items-center gap-2.5">
+              <FolderPlus size={16} className="text-indigo-600 shrink-0" />
+              <span className="text-xs font-semibold">{L('フォルダ追加', 'Add Project Folder', 'Ajouter un dossier')}</span>
+            </span>
+            <span className="text-[11px] text-indigo-500 font-normal">{L('新規作成', 'New Folder', 'Nouveau')}</span>
+          </button>
+
+          {/* Collapse / Expand All */}
+          <button
+            type="button"
+            onClick={() => {
+              handleToggleCollapseAllProjects();
+              setIsQuickMenuOpen(false);
+            }}
+            className="w-full flex items-center justify-between px-3 py-2 rounded-xl hover:bg-slate-100 text-slate-700 transition-colors text-left cursor-pointer min-h-[40px]"
+          >
+            <span className="flex items-center gap-2.5">
+              {isAllProjectsCollapsed ? (
+                <ChevronsUpDown size={16} className="text-amber-600 shrink-0" />
+              ) : (
+                <ChevronsDownUp size={16} className="text-slate-500 shrink-0" />
+              )}
+              <span className="text-xs">{isAllProjectsCollapsed ? L('全フォルダ展開', 'Expand All Folders', 'Développer tout') : L('全フォルダ折畳', 'Collapse All Folders', 'Tout réduire')}</span>
+            </span>
+            <span className={cn(
+              "text-[10px] px-2 py-0.5 rounded-md font-mono font-bold",
+              isAllProjectsCollapsed ? "bg-amber-100 text-amber-800" : "bg-slate-100 text-slate-500"
+            )}>
+              {isAllProjectsCollapsed ? L('折畳中', 'Collapsed', 'Réduit') : L('展開中', 'Expanded', 'Développé')}
+            </span>
+          </button>
+
+          {/* Reset Column Widths */}
+          <button
+            type="button"
+            onClick={() => {
+              handleResetColumnWidths();
+              setIsQuickMenuOpen(false);
             }}
             className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 transition-colors text-left cursor-pointer"
           >
             <span className="flex items-center gap-2">
-              <LayoutGrid size={13} className={isGridEnabled ? "text-indigo-600" : "text-slate-400"} />
-              <span>{L('グリッド線', 'Grid lines', 'Grille')}</span>
+              <ArrowLeftRight size={14} className="text-slate-500 shrink-0" />
+              <span>{L('列幅リセット', 'Reset Column Widths', 'Réinitialiser largeurs')}</span>
             </span>
-            <span className={cn(
-              "text-[9px] px-1.5 py-0.5 rounded font-mono font-bold uppercase",
-              isGridEnabled ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500"
-            )}>
-              {isGridEnabled ? 'ON' : 'OFF'}
-            </span>
+            <span className="text-[10px] text-slate-400">{L('初期値', 'Default', 'Défaut')}</span>
           </button>
-          {isGridEnabled && (
-            <div className="px-2.5 py-1 bg-slate-50 rounded-md flex items-center justify-between text-[10px] text-slate-600 mt-0.5">
-              <span className="font-semibold text-slate-400">{L('刻み', 'Steps', 'Pas')}:</span>
-              {timelineMode === 'calendar' ? (
-                <div className="flex items-center gap-1">
-                  {[1, 2, 4, 6, 12, 24].map(h => (
-                    <button
-                      key={h}
-                      type="button"
-                      onClick={() => handleSetGridStepHours(h)}
-                      className={cn(
-                        "px-1 py-0.5 rounded transition-all",
-                        gridStepHours === h ? "bg-indigo-600 text-white font-bold" : "hover:text-slate-900 bg-white border border-slate-200"
-                      )}
-                    >
-                      {h}h
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <div className="flex items-center gap-1">
-                  {[2, 3, 4, 5].map(s => (
-                    <button
-                      key={s}
-                      type="button"
-                      onClick={() => handleSetStageSubdivisions(s)}
-                      className={cn(
-                        "px-1.5 py-0.5 rounded transition-all",
-                        stageSubdivisions === s ? "bg-indigo-600 text-white font-bold" : "hover:text-slate-900 bg-white border border-slate-200"
-                      )}
-                    >
-                      {s}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
 
-        {/* ToDo List Column Toggle */}
-        <button
-          type="button"
-          onClick={() => {
-            setShowUnscheduledColumn(prev => !prev);
-            setIsQuickMenuOpen(false);
-          }}
-          className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 transition-colors text-left cursor-pointer"
-        >
-          <span className="flex items-center gap-2">
-            <ListTodo size={13} className={showUnscheduledColumn ? "text-amber-600" : "text-slate-400"} />
-            <span>{L('ToDo リスト列', 'ToDo List column', 'Colonne ToDo')}</span>
-          </span>
-          <span className={cn(
-            "text-[9px] px-1.5 py-0.5 rounded font-mono font-bold uppercase",
-            showUnscheduledColumn ? "bg-amber-600 text-white" : "bg-slate-100 text-slate-500"
-          )}>
-            {showUnscheduledColumn ? 'ON' : 'OFF'}
-          </span>
-        </button>
+          {/* Grid ON / OFF */}
+          <div>
+            <button
+              type="button"
+              onClick={() => {
+                handleToggleGrid(!isGridEnabled);
+              }}
+              className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 transition-colors text-left cursor-pointer"
+            >
+              <span className="flex items-center gap-2">
+                <LayoutGrid size={13} className={isGridEnabled ? "text-indigo-600" : "text-slate-400"} />
+                <span>{L('グリッド線', 'Grid lines', 'Grille')}</span>
+              </span>
+              <span className={cn(
+                "text-[9px] px-1.5 py-0.5 rounded font-mono font-bold uppercase",
+                isGridEnabled ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500"
+              )}>
+                {isGridEnabled ? 'ON' : 'OFF'}
+              </span>
+            </button>
+            {isGridEnabled && (
+              <div className="px-2.5 py-1 bg-slate-50 rounded-md flex items-center justify-between text-[10px] text-slate-600 mt-0.5">
+                <span className="font-semibold text-slate-400">{L('刻み', 'Steps', 'Pas')}:</span>
+                {timelineMode === 'calendar' ? (
+                  <div className="flex items-center gap-1">
+                    {[1, 2, 4, 6, 12, 24].map(h => (
+                      <button
+                        key={h}
+                        type="button"
+                        onClick={() => handleSetGridStepHours(h)}
+                        className={cn(
+                          "px-1 py-0.5 rounded transition-all",
+                          gridStepHours === h ? "bg-indigo-600 text-white font-bold" : "hover:text-slate-900 bg-white border border-slate-200"
+                        )}
+                      >
+                        {h}h
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1">
+                    {[2, 3, 4, 5].map(s => (
+                      <button
+                        key={s}
+                        type="button"
+                        onClick={() => handleSetStageSubdivisions(s)}
+                        className={cn(
+                          "px-1.5 py-0.5 rounded transition-all",
+                          stageSubdivisions === s ? "bg-indigo-600 text-white font-bold" : "hover:text-slate-900 bg-white border border-slate-200"
+                        )}
+                      >
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
 
-        {/* Lanes Column Toggle */}
-        <button
-          type="button"
-          onClick={() => {
-            setShowLanesInFullscreen(prev => !prev);
-            setIsQuickMenuOpen(false);
-          }}
-          className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 transition-colors text-left cursor-pointer"
-        >
-          <span className="flex items-center gap-2">
-            <Folder size={13} className="text-indigo-600 shrink-0" />
-            <span>{L('プロジェクトレーン', 'Project Lanes', 'Couloirs de projets')}</span>
-          </span>
-          <span className={cn(
-            "text-[9px] px-1.5 py-0.5 rounded font-mono font-bold uppercase",
-            (!isFullscreen || showLanesInFullscreen) ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500"
-          )}>
-            {(!isFullscreen || showLanesInFullscreen) ? 'ON' : 'OFF'}
-          </span>
-        </button>
-
-        {/* Add Project Folder */}
-        <button
-          type="button"
-          onClick={() => {
-            setTargetParentFolder(null);
-            setNewFolderName('');
-            setIsCreateFolderOpen(true);
-            setIsQuickMenuOpen(false);
-          }}
-          className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 transition-colors text-left cursor-pointer"
-        >
-          <span className="flex items-center gap-2">
-            <FolderPlus size={13} className="text-indigo-600 shrink-0" />
-            <span>{L('フォルダ追加', 'Add Folder', 'Ajouter un dossier')}</span>
-          </span>
-        </button>
-      </div>
-
-      {/* Fullscreen Toggle in Menu */}
-      {onToggleFullscreen && (
-        <>
-          <div className="h-px bg-slate-100 my-1" />
+          {/* ToDo List Column Toggle */}
           <button
             type="button"
             onClick={() => {
-              onToggleFullscreen();
+              setShowUnscheduledColumn(prev => !prev);
               setIsQuickMenuOpen(false);
             }}
-            className={cn(
-              "w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg font-bold transition-colors text-left cursor-pointer",
-              isFullscreen ? "bg-indigo-600 text-white hover:bg-indigo-500" : "bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
-            )}
+            className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 transition-colors text-left cursor-pointer"
           >
             <span className="flex items-center gap-2">
-              {isFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-              <span>{isFullscreen ? L('全画面を終了 (通常表示に戻す)', 'Exit Full View', 'Quitter plein écran') : L('全画面で表示 (Full View)', 'Enter Full View', 'Plein écran')}</span>
+              <ListTodo size={13} className={showUnscheduledColumn ? "text-amber-600" : "text-slate-400"} />
+              <span>{L('ToDo リスト列', 'ToDo List column', 'Colonne ToDo')}</span>
+            </span>
+            <span className={cn(
+              "text-[9px] px-1.5 py-0.5 rounded font-mono font-bold uppercase",
+              showUnscheduledColumn ? "bg-amber-600 text-white" : "bg-slate-100 text-slate-500"
+            )}>
+              {showUnscheduledColumn ? 'ON' : 'OFF'}
             </span>
           </button>
-        </>
-      )}
-    </div>
-  );
 
-  const renderTimeFilterDropdown = () => (
-    <div
-      ref={timeFilterMenuRef}
-      className={cn(
-        "w-72 sm:w-80 bg-white border border-slate-200 rounded-2xl shadow-2xl z-[120] p-3 text-xs select-none animate-in fade-in zoom-in-95 duration-100 text-slate-800",
-        isFullscreen ? "fixed bottom-14 right-2.5" : "absolute right-0 top-full mt-1.5"
-      )}
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-2.5">
-        <div className="flex items-center gap-1.5 min-w-0">
-          <Clock size={14} className="text-indigo-600 shrink-0" />
-          <span className="font-extrabold text-slate-800 text-[11px] truncate">
-            {L('更新日時フィルター', 'Time Filter (Updated)', 'Filtre de mise à jour')}
-          </span>
+          {/* Time Filter in Quick Menu */}
+          <button
+            type="button"
+            data-dropdown-trigger="time-filter"
+            onClick={(e) => {
+              // Anchor to the Menu button at the top toolbar (quickMenuTriggerRect) so it does not open at the bottom of the screen!
+              const rect = quickMenuTriggerRect || e.currentTarget.getBoundingClientRect();
+              setTimeFilterTriggerRect(rect);
+              setIsQuickMenuOpen(false);
+              setIsTimeFilterOpen(true);
+            }}
+            className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 transition-colors text-left cursor-pointer"
+          >
+            <span className="flex items-center gap-2">
+              <Clock size={13} className={timeFilter.enabled ? "text-indigo-600" : "text-slate-400"} />
+              <span>{L('更新日時フィルター', 'Time Filter (Updated)', 'Filtre de date')}</span>
+            </span>
+            <span className={cn(
+              "text-[9px] px-1.5 py-0.5 rounded font-mono font-bold",
+              timeFilter.enabled ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500"
+            )}>
+              {timeFilter.enabled ? getTimeFilterLabel(timeFilter) : L('すべて', 'All', 'Tous')}
+            </span>
+          </button>
         </div>
-        <div className="flex items-center gap-1 shrink-0">
-          <span className={cn(
-            "text-[10px] font-mono px-1.5 py-0.5 rounded-full font-bold",
-            timeFilter.enabled ? "bg-indigo-50 text-indigo-700 border border-indigo-200" : "bg-slate-100 text-slate-500"
-          )}>
-            {activeTasks.length}/{allActiveTasks.length} {L('件', 'items', 'tâches')}
-          </span>
-          {timeFilter.enabled && (
+
+        {/* Fullscreen Toggle in Menu */}
+        {onToggleFullscreen && (
+          <>
+            <div className="h-px bg-slate-100 my-1" />
+            <button
+              type="button"
+              onClick={() => {
+                onToggleFullscreen();
+                setIsQuickMenuOpen(false);
+              }}
+              className={cn(
+                "w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg font-bold transition-colors text-left cursor-pointer",
+                isFullscreen ? "bg-indigo-600 text-white hover:bg-indigo-500" : "bg-indigo-50 text-indigo-700 hover:bg-indigo-100"
+              )}
+            >
+              <span className="flex items-center gap-2">
+                {isFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+                <span>{isFullscreen ? L('全画面を終了 (通常表示に戻す)', 'Exit Full View', 'Quitter plein écran') : L('全画面で表示 (Full View)', 'Enter Full View', 'Plein écran')}</span>
+              </span>
+            </button>
+          </>
+        )}
+        {/* Bottom clearance spacer so the last item is 100% visible and never crowded or cut off */}
+        <div className="h-8 sm:h-4 shrink-0" />
+      </div>
+    </>,
+    document.body
+  );
+};
+
+  const renderTimeFilterDropdown = () => {
+    if (typeof document === 'undefined') return null;
+
+    const isMobile = typeof window !== 'undefined' && window.innerWidth < 640;
+    const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 800;
+    const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : 1200;
+    const estimatedHeight = 440;
+    const menuWidth = 320; // 20rem
+
+    let menuStyle: React.CSSProperties = {};
+
+    if (isFullscreen) {
+      menuStyle = {
+        position: 'fixed',
+        bottom: 'calc(4rem + env(safe-area-inset-bottom, 0px))',
+        right: '12px',
+        maxWidth: 'calc(100vw - 24px)',
+        maxHeight: 'calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 6rem)',
+      };
+    } else if (isMobile || viewportHeight < 560) {
+      // Centered on mobile or short screens to ensure 100% visibility without cutoffs
+      menuStyle = {
+        position: 'fixed',
+        top: '50%',
+        left: '50%',
+        transform: 'translate(-50%, -50%)',
+        width: 'calc(100vw - 24px)',
+        maxWidth: '360px',
+        maxHeight: 'calc(100dvh - 2.5rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))',
+      };
+    } else {
+      let topPx: number;
+      if (timeFilterTriggerRect) {
+        // If trigger is located in lower half of screen, open upwards above trigger
+        if (timeFilterTriggerRect.top > viewportHeight - estimatedHeight) {
+          topPx = Math.max(16, timeFilterTriggerRect.top - estimatedHeight - 8);
+        } else {
+          // Open downwards below trigger
+          topPx = Math.max(16, timeFilterTriggerRect.bottom + 8);
+        }
+
+        // Strict clamp to guarantee the dropdown bottom NEVER extends beyond viewport
+        if (topPx + estimatedHeight > viewportHeight - 16) {
+          topPx = Math.max(16, viewportHeight - estimatedHeight - 16);
+        }
+      } else {
+        topPx = 56;
+      }
+
+      let leftPx: number;
+      if (timeFilterTriggerRect) {
+        if (timeFilterTriggerRect.right > viewportWidth - 340) {
+          leftPx = Math.max(12, Math.min(viewportWidth - menuWidth - 16, timeFilterTriggerRect.right - menuWidth));
+        } else {
+          leftPx = Math.max(12, Math.min(viewportWidth - menuWidth - 16, timeFilterTriggerRect.left));
+        }
+      } else {
+        leftPx = 16;
+      }
+
+      menuStyle = {
+        position: 'fixed',
+        top: `${topPx}px`,
+        left: `${leftPx}px`,
+        width: '20rem',
+        maxWidth: 'calc(100vw - 24px)',
+        maxHeight: `${Math.max(260, viewportHeight - topPx - 16)}px`,
+      };
+    }
+
+    return createPortal(
+      <>
+        {/* Backdrop Overlay to prevent cutoff and ensure smooth touch dismissal */}
+        <div 
+          className="fixed inset-0 bg-slate-900/30 sm:bg-slate-900/10 backdrop-blur-2xs z-[120]"
+          onClick={() => setIsTimeFilterOpen(false)}
+        />
+
+        <div
+          ref={timeFilterMenuRef}
+          style={menuStyle}
+          className="bg-white border border-slate-200 rounded-2xl shadow-2xl z-[125] p-3 text-xs select-none animate-in fade-in zoom-in-95 duration-100 text-slate-800 box-border overflow-y-auto overscroll-contain"
+        >
+        {/* Header */}
+        <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-2.5">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <Clock size={14} className="text-indigo-600 shrink-0" />
+            <span className="font-extrabold text-slate-800 text-[11px] truncate">
+              {L('更新日時フィルター', 'Time Filter (Updated)', 'Filtre de mise à jour')}
+            </span>
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            <span className={cn(
+              "text-[10px] font-mono px-1.5 py-0.5 rounded-full font-bold",
+              timeFilter.enabled ? "bg-indigo-50 text-indigo-700 border border-indigo-200" : "bg-slate-100 text-slate-500"
+            )}>
+              {activeTasks.length}/{allActiveTasks.length} {L('件', 'items', 'tâches')}
+            </span>
+            {timeFilter.enabled && (
+              <button
+                type="button"
+                onClick={() => {
+                  handleUpdateTimeFilter({ enabled: false });
+                  setIsTimeFilterOpen(false);
+                }}
+                className="text-[10px] font-bold text-red-600 hover:text-red-700 hover:bg-red-50 px-1.5 py-0.5 rounded transition-colors cursor-pointer"
+                title={L('フィルターを解除してすべて表示', 'Clear filter', 'Effacer le filtre')}
+              >
+                {L('解除', 'Clear', 'Effacer')}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setIsTimeFilterOpen(false)}
+              className="text-slate-400 hover:text-slate-700 hover:bg-slate-100 p-1 rounded-lg transition-colors cursor-pointer ml-0.5"
+              title={L('閉じる', 'Close', 'Fermer')}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+
+        {/* Quick Presets */}
+        <div className="mb-2.5">
+          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5 flex items-center justify-between">
+            <span>{L('クイック指定', 'Quick Presets', 'Sélection rapide')}</span>
+            <span className="text-[9px] text-slate-400 font-normal">{L('ワンクリックで絞り込み', 'One click', '1 clic')}</span>
+          </div>
+          <div className="grid grid-cols-3 gap-1">
             <button
               type="button"
               onClick={() => {
                 handleUpdateTimeFilter({ enabled: false });
                 setIsTimeFilterOpen(false);
               }}
-              className="text-[10px] font-bold text-red-600 hover:text-red-700 hover:bg-red-50 px-1.5 py-0.5 rounded transition-colors cursor-pointer"
-              title={L('フィルターを解除してすべて表示', 'Clear filter', 'Effacer le filtre')}
+              className={cn(
+                "py-1 px-1 rounded-lg text-[10px] font-bold transition-all border text-center cursor-pointer truncate",
+                !timeFilter.enabled
+                  ? "bg-indigo-600 text-white border-indigo-600 shadow-2xs"
+                  : "bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200"
+              )}
             >
-              {L('解除', 'Clear', 'Effacer')}
+              {L('すべて表示', 'Show All', 'Tout afficher')}
             </button>
-          )}
-        </div>
-      </div>
-
-      {/* Quick Presets */}
-      <div className="mb-3">
-        <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5 flex items-center justify-between">
-          <span>{L('クイック指定', 'Quick Presets', 'Sélection rapide')}</span>
-          <span className="text-[9px] text-slate-400 font-normal">{L('ワンクリックで絞り込み', 'One click', '1 clic')}</span>
-        </div>
-        <div className="grid grid-cols-3 gap-1">
-          <button
-            type="button"
-            onClick={() => {
-              handleUpdateTimeFilter({ enabled: false });
-              setIsTimeFilterOpen(false);
-            }}
-            className={cn(
-              "py-1 px-1.5 rounded-lg text-[10px] font-bold transition-all border text-center cursor-pointer",
-              !timeFilter.enabled
-                ? "bg-indigo-600 text-white border-indigo-600 shadow-2xs"
-                : "bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200"
-            )}
-          >
-            {L('すべて表示', 'Show All', 'Tout afficher')}
-          </button>
-          {[
-            { label: L('1週間以上前', '1w+ ago', '1+ sem.'), amount: 1, unit: 'week' as TimeFilterUnit },
-            { label: L('2週間以上前', '2w+ ago', '2+ sem.'), amount: 2, unit: 'week' as TimeFilterUnit },
-            { label: L('1ヶ月以上前', '1mo+ ago', '1+ mois'), amount: 1, unit: 'month' as TimeFilterUnit },
-            { label: L('3ヶ月以上前', '3mo+ ago', '3+ mois'), amount: 3, unit: 'month' as TimeFilterUnit },
-            { label: L('6ヶ月以上前', '6mo+ ago', '6+ mois'), amount: 6, unit: 'month' as TimeFilterUnit },
-            { label: L('1年以上前', '1y+ ago', '1+ an'), amount: 1, unit: 'year' as TimeFilterUnit },
-          ].map(preset => {
-            const isSelected = timeFilter.enabled && timeFilter.amount === preset.amount && timeFilter.unit === preset.unit;
-            return (
-              <button
-                key={`${preset.amount}-${preset.unit}`}
-                type="button"
-                onClick={() => {
-                  handleUpdateTimeFilter({ enabled: true, amount: preset.amount, unit: preset.unit });
-                  setIsTimeFilterOpen(false);
-                }}
-                className={cn(
-                  "py-1 px-1.5 rounded-lg text-[10px] font-bold transition-all border text-center cursor-pointer",
-                  isSelected
-                    ? "bg-indigo-600 text-white border-indigo-600 shadow-2xs"
-                    : "bg-white hover:bg-indigo-50/60 text-slate-700 border-slate-200"
-                )}
-              >
-                {preset.label}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Custom Number & Unit Selector */}
-      <div className="pt-2 border-t border-slate-100">
-        <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">
-          {L('数値を指定して絞り込み', 'Custom Time Period', 'Période personnalisée')}
-        </div>
-        <div className="p-2 bg-slate-50/80 rounded-xl border border-slate-200/80 space-y-2">
-          {/* Stepper & Number Input */}
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-[11px] font-semibold text-slate-600">{L('期間の数値', 'Number', 'Nombre')}:</span>
-            <div className="flex items-center bg-white border border-slate-300 rounded-lg p-0.5 shadow-2xs">
-              <button
-                type="button"
-                onClick={() => setCustomAmountInput(prev => Math.max(1, prev - 1))}
-                className="w-6 h-6 flex items-center justify-center rounded text-slate-600 hover:bg-slate-100 font-bold text-xs cursor-pointer"
-                title="-1"
-              >
-                -
-              </button>
-              <input
-                type="number"
-                min="1"
-                max="99"
-                value={customAmountInput}
-                onChange={(e) => {
-                  const val = parseInt(e.target.value, 10);
-                  if (!isNaN(val) && val > 0) setCustomAmountInput(Math.min(99, val));
-                }}
-                className="w-10 text-center font-mono font-bold text-xs text-slate-800 outline-none p-0 border-0"
-              />
-              <button
-                type="button"
-                onClick={() => setCustomAmountInput(prev => Math.min(99, prev + 1))}
-                className="w-6 h-6 flex items-center justify-center rounded text-slate-600 hover:bg-slate-100 font-bold text-xs cursor-pointer"
-                title="+1"
-              >
-                +
-              </button>
-            </div>
-          </div>
-
-          {/* Unit Tabs */}
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-[11px] font-semibold text-slate-600">{L('単位', 'Unit', 'Unité')}:</span>
-            <div className="grid grid-cols-3 gap-1 bg-slate-200/60 p-0.5 rounded-lg flex-1 max-w-[170px]">
-              {[
-                { id: 'week' as TimeFilterUnit, ja: '週間', en: 'Weeks', fr: 'Sem.' },
-                { id: 'month' as TimeFilterUnit, ja: 'ヶ月', en: 'Months', fr: 'Mois' },
-                { id: 'year' as TimeFilterUnit, ja: '年', en: 'Years', fr: 'Ans' },
-              ].map(u => (
+            {[
+              { label: L('1週間以上前', '1w+ ago', '1+ sem.'), amount: 1, unit: 'week' as TimeFilterUnit },
+              { label: L('2週間以上前', '2w+ ago', '2+ sem.'), amount: 2, unit: 'week' as TimeFilterUnit },
+              { label: L('1ヶ月以上前', '1mo+ ago', '1+ mois'), amount: 1, unit: 'month' as TimeFilterUnit },
+              { label: L('3ヶ月以上前', '3mo+ ago', '3+ mois'), amount: 3, unit: 'month' as TimeFilterUnit },
+              { label: L('6ヶ月以上前', '6mo+ ago', '6+ mois'), amount: 6, unit: 'month' as TimeFilterUnit },
+              { label: L('1年以上前', '1y+ ago', '1+ an'), amount: 1, unit: 'year' as TimeFilterUnit },
+            ].map(preset => {
+              const isSelected = timeFilter.enabled && timeFilter.amount === preset.amount && timeFilter.unit === preset.unit;
+              return (
                 <button
-                  key={u.id}
+                  key={`${preset.amount}-${preset.unit}`}
                   type="button"
-                  onClick={() => setCustomUnitInput(u.id)}
+                  onClick={() => {
+                    handleUpdateTimeFilter({ enabled: true, amount: preset.amount, unit: preset.unit });
+                    setIsTimeFilterOpen(false);
+                  }}
                   className={cn(
-                    "py-1 text-[10px] font-bold rounded-md transition-all text-center cursor-pointer",
-                    customUnitInput === u.id
-                      ? "bg-white text-indigo-700 shadow-2xs font-extrabold"
-                      : "text-slate-600 hover:text-slate-900"
+                    "py-1 px-1 rounded-lg text-[10px] font-bold transition-all border text-center cursor-pointer truncate",
+                    isSelected
+                      ? "bg-indigo-600 text-white border-indigo-600 shadow-2xs"
+                      : "bg-white hover:bg-indigo-50/60 text-slate-700 border-slate-200"
                   )}
                 >
-                  {tr(language, u.ja, u.en, u.fr)}
+                  {preset.label}
                 </button>
-              ))}
-            </div>
+              );
+            })}
           </div>
+        </div>
 
-          {/* Apply button */}
-          <button
-            type="button"
-            onClick={() => {
-              handleUpdateTimeFilter({
-                enabled: true,
-                amount: Math.max(1, customAmountInput),
-                unit: customUnitInput
-              });
-              setIsTimeFilterOpen(false);
-            }}
-            className="w-full py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold transition-all shadow-xs flex items-center justify-center gap-1.5 cursor-pointer mt-1"
-          >
-            <Check size={12} />
-            <span>
-              {L(
-                `過去 ${customAmountInput} ${customUnitInput === 'week' ? '週間' : customUnitInput === 'month' ? 'ヶ月' : '年'} 以上前に更新されたタスクを表示`,
-                `Show tasks older than ${customAmountInput} ${customUnitInput === 'week' ? 'weeks' : customUnitInput === 'month' ? 'months' : 'years'}`,
-                `Afficher les tâches antérieures à ${customAmountInput} ${customUnitInput}`
-              )}
-            </span>
-          </button>
+        {/* Custom Number & Unit Selector */}
+        <div className="pt-2 border-t border-slate-100">
+          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5">
+            {L('数値を指定して絞り込み', 'Custom Time Period', 'Période personnalisée')}
+          </div>
+          <div className="p-2 bg-slate-50/80 rounded-xl border border-slate-200/80 space-y-2">
+            {/* Stepper & Number Input */}
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-semibold text-slate-600 shrink-0">{L('期間の数値', 'Number', 'Nombre')}:</span>
+              <div className="flex items-center bg-white border border-slate-300 rounded-lg p-0.5 shadow-2xs">
+                <button
+                  type="button"
+                  onClick={() => setCustomAmountInput(prev => Math.max(1, prev - 1))}
+                  className="w-6 h-6 flex items-center justify-center rounded text-slate-600 hover:bg-slate-100 font-bold text-xs cursor-pointer"
+                  title="-1"
+                >
+                  -
+                </button>
+                <input
+                  type="number"
+                  min="1"
+                  max="99"
+                  value={customAmountInput}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value, 10);
+                    if (!isNaN(val) && val > 0) setCustomAmountInput(Math.min(99, val));
+                  }}
+                  className="w-10 text-center font-mono font-bold text-xs text-slate-800 outline-none p-0 border-0"
+                />
+                <button
+                  type="button"
+                  onClick={() => setCustomAmountInput(prev => Math.min(99, prev + 1))}
+                  className="w-6 h-6 flex items-center justify-center rounded text-slate-600 hover:bg-slate-100 font-bold text-xs cursor-pointer"
+                  title="+1"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+
+            {/* Unit Tabs */}
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-semibold text-slate-600 shrink-0">{L('単位', 'Unit', 'Unité')}:</span>
+              <div className="grid grid-cols-3 gap-1 bg-slate-200/60 p-0.5 rounded-lg flex-1 max-w-[170px]">
+                {[
+                  { id: 'week' as TimeFilterUnit, ja: '週間', en: 'Weeks', fr: 'Sem.' },
+                  { id: 'month' as TimeFilterUnit, ja: 'ヶ月', en: 'Months', fr: 'Mois' },
+                  { id: 'year' as TimeFilterUnit, ja: '年', en: 'Years', fr: 'Ans' },
+                ].map(u => (
+                  <button
+                    key={u.id}
+                    type="button"
+                    onClick={() => setCustomUnitInput(u.id)}
+                    className={cn(
+                      "py-1 text-[10px] font-bold rounded-md transition-all text-center cursor-pointer",
+                      customUnitInput === u.id
+                        ? "bg-white text-indigo-700 shadow-2xs font-extrabold"
+                        : "text-slate-600 hover:text-slate-900"
+                    )}
+                  >
+                    {tr(language, u.ja, u.en, u.fr)}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Apply button */}
+            <button
+              type="button"
+              onClick={() => {
+                handleUpdateTimeFilter({
+                  enabled: true,
+                  amount: Math.max(1, customAmountInput),
+                  unit: customUnitInput
+                });
+                setIsTimeFilterOpen(false);
+              }}
+              className="w-full py-2 px-2.5 bg-indigo-600 hover:bg-indigo-700 active:scale-[0.99] text-white rounded-xl text-xs font-bold transition-all shadow-xs flex items-center justify-center gap-1.5 cursor-pointer mt-1"
+            >
+              <Check size={13} className="shrink-0" />
+              <span className="text-center leading-tight truncate">
+                {L(
+                  `${customAmountInput}${customUnitInput === 'week' ? '週間' : customUnitInput === 'month' ? 'ヶ月' : '年'}以上前のタスクを表示`,
+                  `Show tasks older than ${customAmountInput} ${customUnitInput === 'week' ? 'w' : customUnitInput === 'month' ? 'mo' : 'y'}`,
+                  `Afficher tâches > ${customAmountInput} ${customUnitInput}`
+                )}
+              </span>
+            </button>
+          </div>
+        </div>
+
+        {/* Explanatory description footer */}
+        <div className="mt-2 text-[9.5px] text-slate-500 leading-tight flex items-start gap-1">
+          <Clock size={10} className="shrink-0 mt-0.5 text-slate-400" />
+          <span>
+            {L(
+              '指定期間よりも古い（指定期間以上更新されていない）タスクをタイムライン上に表示します。',
+              'Shows tasks older than the specified period (not updated since then).',
+              'Affiche les tâches antérieures à la période spécifiée.'
+            )}
+          </span>
         </div>
       </div>
-
-      {/* Explanatory description footer */}
-      <div className="mt-2 text-[9px] text-slate-400 leading-normal flex items-start gap-1">
-        <Clock size={10} className="shrink-0 mt-0.5 text-slate-400" />
-        <span>
-          {L(
-            '指定された期間よりも古い（指定期間以上更新されていない）タスクをタイムライン上に表示します。',
-            'Shows tasks older than the specified period (not updated since then).',
-            'Affiche les tâches antérieures à la période spécifiée (non mises à jour depuis).'
-          )}
-        </span>
-      </div>
-    </div>
+    </>,
+    document.body
   );
+};
 
   return (
     <div 
@@ -3251,435 +3985,152 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     >
       {/* Timeline Top Control Toolbar (Normal View only - Hidden in Full View to maximize screen space for Timeline) */}
       {!isFullscreen && (
-        <div className="relative z-40 flex items-center justify-between px-2 sm:px-3 border-b shrink-0 select-none flex-wrap gap-1.5 sm:gap-2 max-w-full py-1.5 sm:py-2 bg-slate-50/90 border-slate-200">
-          <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap min-w-0 max-w-full">
+        <div className="relative z-50 flex items-center justify-between px-2 sm:px-3 border-b shrink-0 select-none py-1.5 bg-slate-50/90 border-slate-200 min-h-[38px] w-full max-w-full flex-nowrap gap-1.5 sm:gap-2">
+          {/* Left: Mode Switcher (Dates vs Custom/Stages) & Phase Pattern Button */}
+          <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 flex-1 flex-nowrap">
+            {/* Optional Small Project Timeline Title (hidden on small/medium screens to ensure 100% 1-line fit on mobile) */}
             <button
               type="button"
               onClick={() => onToggleFullscreen?.()}
-              className="flex items-center gap-1.5 text-xs font-bold text-slate-800 hover:text-indigo-600 transition-colors cursor-pointer"
+              className="hidden lg:flex items-center gap-1.5 text-xs font-bold text-slate-800 hover:text-indigo-600 transition-colors cursor-pointer shrink-0"
               title={L('クリックしてタイムラインを全画面表示 (Full view)', 'Click to enter Fullscreen Timeline (Full view)', 'Appuyez pour passer en plein écran')}
             >
-              <CalendarDays size={16} className="text-indigo-600 shrink-0" />
-              <span>{L('プロジェクト タイムライン', 'Project Timeline', 'Chronologie des projets')}</span>
+              <CalendarDays size={15} className="text-indigo-600 shrink-0" />
+              <span className="whitespace-nowrap">{L('タイムライン', 'Timeline', 'Chronologie')}</span>
             </button>
 
-          <div className="h-4 w-px bg-slate-200 mx-1 hidden sm:block" />
+            <div className="h-4 w-px bg-slate-200 mx-0.5 hidden lg:block shrink-0" />
 
-          {/* Mode Switcher: Calendar Dates vs Custom Columns */}
-          <div className="flex items-center bg-white border border-slate-200 rounded-lg p-0.5 shadow-2xs">
-            <button
-              onClick={() => handleSetTimelineMode('calendar')}
-              className={cn(
-                "px-2 sm:px-2.5 py-1 text-[10px] sm:text-[11px] font-bold rounded-md transition-all flex items-center gap-1",
-                timelineMode === 'calendar'
-                  ? "bg-indigo-600 text-white shadow-2xs"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              )}
-              title={L("日付基準（カレンダー日付）", "Calendar Dates", "Dates du calendrier")}
-            >
-              <CalendarIcon size={12} />
-              <span>{L("日付基準", "Dates", "Dates")}</span>
-            </button>
-            <button
-              onClick={() => handleSetTimelineMode('custom')}
-              className={cn(
-                "px-2 sm:px-2.5 py-1 text-[10px] sm:text-[11px] font-bold rounded-md transition-all flex items-center gap-1",
-                timelineMode === 'custom'
-                  ? "bg-indigo-600 text-white shadow-2xs"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              )}
-              title={L("抽象的期間・ステージ（1 day, 1 week, カスタム列）", "Abstract Periods & Stages", "Périodes et étapes personnalisées")}
-            >
-              <SlidersHorizontal size={12} />
-              <span>{L("カスタム期間", "Custom / Stages", "Étapes")}</span>
-            </button>
-          </div>
-
-          {/* Calendar Controls (Only in Calendar Mode) */}
-          {timelineMode === 'calendar' ? (
-            <div className="flex items-center gap-1 bg-white border border-slate-200 rounded-lg p-0.5 shadow-2xs">
-              <button
-                onClick={() => handleNavigate('prev')}
-                className="p-1 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded transition-colors"
-                title={L('1週間前へ', 'Previous week', 'Semaine précédente')}
-              >
-                <ChevronLeft size={14} />
-              </button>
-              <button
-                onClick={() => handleNavigate('today')}
-                className="px-2 py-0.5 text-[10px] sm:text-[11px] font-bold text-indigo-600 hover:bg-indigo-50 rounded transition-colors"
-              >
-                {L('今日', 'Today', "Aujourd'hui")}
-              </button>
-              <button
-                onClick={() => handleNavigate('next')}
-                className="p-1 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded transition-colors"
-                title={L('1週間後へ', 'Next week', 'Semaine suivante')}
-              >
-                <ChevronRight size={14} />
-              </button>
-            </div>
-          ) : (
-            /* Custom Columns Controls (Phase Pattern Selector, Add Column & Reset) */
-            <div className="flex items-center gap-1.5 flex-wrap">
-              {/* Phase Pattern Switcher & Manager */}
-              <div className="relative inline-flex items-center" ref={patternMenuRef}>
-                {isRenamingActiveInToolbar ? (
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      handleRenamePattern(activePattern.id, toolbarPatternName);
-                      setIsRenamingActiveInToolbar(false);
-                    }}
-                    className="flex items-center gap-1 bg-white border border-indigo-500 rounded-lg p-0.5 shadow-xs"
-                  >
-                    <input
-                      autoFocus
-                      type="text"
-                      value={toolbarPatternName}
-                      onChange={(e) => setToolbarPatternName(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Escape') setIsRenamingActiveInToolbar(false);
-                      }}
-                      onBlur={() => {
-                        handleRenamePattern(activePattern.id, toolbarPatternName);
-                        setIsRenamingActiveInToolbar(false);
-                      }}
-                      className="px-2 py-0.5 text-[10px] sm:text-[11px] font-bold text-slate-800 outline-none w-28 sm:w-36"
-                      placeholder={L('パターン名', 'Pattern name', 'Nom du modèle')}
-                    />
-                    <button
-                      type="submit"
-                      className="p-1 text-emerald-600 hover:bg-emerald-50 rounded cursor-pointer"
-                      title={L('保存', 'Save', 'Enregistrer')}
-                    >
-                      <Check size={12} />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setIsRenamingActiveInToolbar(false)}
-                      className="p-1 text-slate-400 hover:bg-slate-100 rounded cursor-pointer"
-                      title={L('キャンセル', 'Cancel', 'Annuler')}
-                    >
-                      <X size={12} />
-                    </button>
-                  </form>
-                ) : (
-                  <div className="flex items-center bg-indigo-50 border border-indigo-200/90 rounded-lg p-0.5 shadow-2xs">
-                    <button
-                      type="button"
-                      onClick={() => setIsPatternMenuOpen(prev => !prev)}
-                      className="px-2 py-1 text-[10px] sm:text-[11px] font-bold text-indigo-900 hover:bg-indigo-100/70 rounded-md transition-colors flex items-center gap-1 sm:gap-1.5 cursor-pointer select-none"
-                      title={L('Phaseパターンを切り替え・管理', 'Switch & manage phase patterns', 'Gérer les modèles de phases')}
-                    >
-                      <Workflow size={13} className="text-indigo-600 shrink-0" />
-                      <span className="text-slate-500 font-medium text-[10px] hidden md:inline">{L('パターン:', 'Pattern:', 'Modèle :')}</span>
-                      <span className="font-extrabold text-indigo-700 max-w-[120px] sm:max-w-[160px] truncate">{activePattern.name}</span>
-                      <span className="text-[9px] sm:text-[10px] px-1.5 py-0.2 bg-indigo-200/70 text-indigo-800 rounded font-mono font-bold leading-tight">
-                        {customColumns.length}{L('列', 'cols', 'cols')}
-                      </span>
-                      <ChevronDown size={11} className={cn("text-indigo-500 transition-transform duration-150", isPatternMenuOpen && "rotate-180")} />
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setIsRenamingActiveInToolbar(true);
-                        setToolbarPatternName(activePattern.name);
-                      }}
-                      className="p-1 text-indigo-400 hover:text-indigo-700 hover:bg-indigo-100/60 rounded transition-colors cursor-pointer"
-                      title={L('パターン名を変更', 'Rename pattern', 'Renommer le modèle')}
-                    >
-                      <Edit2 size={11} />
-                    </button>
-                  </div>
-                )}
-
-                {/* Dropdown Menu */}
-                {isPatternMenuOpen && renderPatternMenuDropdown()}
-              </div>
-
-              {/* Add Column Button */}
-              <button
-                onClick={handleAddColumn}
-                className="px-2 py-1 text-[10px] sm:text-[11px] font-bold bg-white text-indigo-700 border border-indigo-200 hover:bg-indigo-50 rounded-lg transition-colors flex items-center gap-1 shadow-2xs cursor-pointer"
-                title={L(`「${activePattern.name}」に新しいPhase列を追加`, `Add Phase column to "${activePattern.name}"`, `Ajouter une colonne à « ${activePattern.name} »`)}
-              >
-                <Plus size={13} />
-                <span>{L("列を追加", "Add Column", "Ajouter colonne")}</span>
-              </button>
-
-              {/* Reset Custom Phases (Names & Count) Button */}
+            {/* 1. Dates vs Custom/Phase Switcher */}
+            <div className="flex items-center bg-white border border-slate-200 rounded-xl p-0.5 shadow-2xs shrink-0">
               <button
                 type="button"
-                onClick={() => handleResetCustomColumns('names_only')}
-                className="px-2 py-1 text-[10px] sm:text-[11px] font-bold bg-white text-slate-700 border border-slate-200 hover:bg-slate-50 hover:text-indigo-600 rounded-lg transition-colors flex items-center gap-1 shadow-2xs cursor-pointer"
-                title={L(`「${activePattern.name}」のPhase列名をデフォルト（Phase 1, 2, 3...）に再設定`, `Reset Phase column names of "${activePattern.name}" to default (Phase 1, 2, 3...)`, `Réinitialiser les noms des phases`)}
+                onClick={() => handleSetTimelineMode('calendar')}
+                className={cn(
+                  "px-2 sm:px-2.5 py-1.5 sm:py-1 text-xs sm:text-[11px] font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer shrink-0 min-h-[36px] sm:min-h-[30px]",
+                  timelineMode === 'calendar'
+                    ? "bg-indigo-600 text-white shadow-xs"
+                    : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+                )}
+                title={L("Dates（カレンダー日付基準）", "Calendar Dates", "Dates du calendrier")}
               >
-                <RefreshCw size={12} className="text-slate-500" />
-                <span>{L("Reset Phases", "Reset Phases", "Réinitialiser phases")}</span>
+                <CalendarIcon size={15} className="shrink-0" />
+                <span>Dates</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSetTimelineMode('custom')}
+                className={cn(
+                  "px-2 sm:px-2.5 py-1.5 sm:py-1 text-xs sm:text-[11px] font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer shrink-0 min-h-[36px] sm:min-h-[30px]",
+                  timelineMode === 'custom'
+                    ? "bg-indigo-600 text-white shadow-xs"
+                    : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+                )}
+                title={L("Phase（ステージ・カスタム期間）", "Phase / Stages", "Phases")}
+              >
+                <SlidersHorizontal size={15} className="shrink-0" />
+                <span>Phase</span>
               </button>
             </div>
-          )}
 
-          {timelineMode === 'calendar' && (
-            <span className="text-[11px] font-mono text-slate-500 hidden sm:inline">
-              {language === 'fr'
-                ? `${format(timelineDates[0], 'dd/MM/yyyy')} - ${format(timelineDates[timelineDates.length - 1], 'dd/MM')}`
-                : language === 'en'
-                  ? `${format(timelineDates[0], 'MM/dd/yyyy')} - ${format(timelineDates[timelineDates.length - 1], 'MM/dd')}`
-                  : `${format(timelineDates[0], 'yyyy/MM/dd')} - ${format(timelineDates[timelineDates.length - 1], 'MM/dd')}`}
-            </span>
-          )}
-        </div>
-
-        {/* View Options Right */}
-        <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap min-w-0 max-w-full">
-          {/* Add Project Folder Button */}
-          <button
-            onClick={() => {
-              setTargetParentFolder(null);
-              setNewFolderName('');
-              setIsCreateFolderOpen(true);
-            }}
-            className="px-2 sm:px-2.5 py-1 text-[10px] sm:text-[11px] font-bold rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-all flex items-center gap-1 sm:gap-1.5 shadow-2xs"
-            title={L("プロジェクトフォルダを追加", "Add Project Folder", "Ajouter un dossier de projet")}
-          >
-            <FolderPlus size={13} className="text-indigo-600 shrink-0" />
-            <span>{L("フォルダ追加", "Add Folder", "Ajouter dossier")}</span>
-          </button>
-
-          {/* Collapse / Expand All Project Folders Button */}
-          <button
-            onClick={handleToggleCollapseAllProjects}
-            className={cn(
-              "px-2 sm:px-2.5 py-1 text-[10px] sm:text-[11px] font-bold rounded-lg border transition-all flex items-center gap-1 sm:gap-1.5 shadow-2xs",
-              isAllProjectsCollapsed
-                ? "bg-amber-50 text-amber-800 border-amber-300 hover:bg-amber-100"
-                : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
-            )}
-            title={isAllProjectsCollapsed 
-              ? L("すべてのプロジェクトフォルダを展開", "Expand all project folders", "Développer tous les dossiers") 
-              : L("すべてのプロジェクトフォルダを折りたたむ", "Collapse all project folders", "Réduire tous les dossiers")
-            }
-          >
-            {isAllProjectsCollapsed ? (
-              <ChevronsUpDown size={13} className="text-amber-600 shrink-0" />
-            ) : (
-              <ChevronsDownUp size={13} className="text-slate-500 shrink-0" />
-            )}
-            <span>
-              {isAllProjectsCollapsed 
-                ? L("全フォルダ展開", "Expand All", "Tout développer") 
-                : L("全フォルダ折畳", "Collapse All", "Tout réduire")
-              }
-            </span>
-          </button>
-
-          {/* Reset All Column Widths Button */}
-          <button
-            onClick={handleResetColumnWidths}
-            className="px-2 sm:px-2.5 py-1 text-[10px] sm:text-[11px] font-bold rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-all flex items-center gap-1 sm:gap-1.5 shadow-2xs"
-            title={L("プロジェクト、ToDo、フェーズの全列幅を初期値にリセット", "Reset all column widths to default", "Réinitialiser la largeur de toutes les colonnes")}
-          >
-            <ArrowLeftRight size={12} className="text-slate-500 shrink-0" />
-            <span>{L("列幅リセット", "Reset Widths", "Réinitialiser largeurs")}</span>
-          </button>
-
-          {/* ToDo List (Unscheduled) Column Toggle */}
-          <button
-            onClick={() => setShowUnscheduledColumn(!showUnscheduledColumn)}
-            className={cn(
-              "px-2 py-1 text-[10px] sm:text-[11px] font-semibold rounded-lg border transition-colors flex items-center gap-1 sm:gap-1.5",
-              showUnscheduledColumn 
-                ? "bg-amber-50 text-amber-800 border-amber-300 font-bold" 
-                : "bg-white text-slate-500 border-slate-200 hover:bg-slate-50"
-            )}
-            title={L('ToDo リスト枠（日程未割当）の表示切り替え', 'Toggle ToDo List (Unscheduled) column', 'Afficher/masquer la colonne Liste de tâches')}
-          >
-            <ListTodo size={13} className={showUnscheduledColumn ? "text-amber-600" : "text-slate-400"} />
-            <span className="hidden md:inline">{L('ToDo リスト', 'ToDo List', 'Liste de tâches')}</span>
-          </button>
-
-          {/* Days Range Selector (Only in Calendar Mode) */}
-          {timelineMode === 'calendar' && (
-            <div className="flex bg-white border border-slate-200 rounded-lg p-0.5 text-[10px] sm:text-[11px] font-semibold text-slate-600">
-              {[7, 14, 21].map(days => (
-                <button
-                  key={days}
-                  onClick={() => setDaysCount(days)}
-                  className={cn(
-                    "px-1.5 sm:px-2 py-0.5 rounded transition-all",
-                    daysCount === days ? "bg-indigo-600 text-white shadow-2xs font-bold" : "hover:text-slate-900"
-                  )}
-                >
-                  {days}{L('日', 'd', 'j')}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {/* Grid ON / OFF Toggle (Supported in both Dates and Custom/Stages) */}
-          <button
-            onClick={() => handleToggleGrid(!isGridEnabled)}
-            className={cn(
-              "px-2 py-1 text-[10px] sm:text-[11px] font-semibold rounded-lg border transition-all flex items-center gap-1 sm:gap-1.5 shadow-2xs",
-              isGridEnabled
-                ? "bg-indigo-50 text-indigo-700 border-indigo-200 font-bold"
-                : "bg-white text-slate-500 border-slate-200 hover:bg-slate-50"
-            )}
-            title={isGridEnabled ? L('グリッドをOFFにする', 'Turn Grid OFF', 'Désactiver la grille') : L('グリッドをONにする', 'Turn Grid ON', 'Activer la grille')}
-          >
-            <LayoutGrid size={13} className={isGridEnabled ? "text-indigo-600" : "text-slate-400"} />
-            <span>{L('グリッド', 'Grid', 'Grille')}</span>
-            <span className={cn(
-              "text-[9px] px-1 py-0.5 rounded font-mono font-bold uppercase",
-              isGridEnabled ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500"
-            )}>
-              {isGridEnabled ? 'ON' : 'OFF'}
-            </span>
-          </button>
-
-          {/* Fine Grid Step Granularity Selector (Dates: 1-24h, Custom: 2-5 steps) */}
-          {isGridEnabled && timelineMode === 'calendar' && (
-            <div className="flex items-center flex-wrap bg-white border border-slate-200 rounded-lg p-0.5 text-[10px] sm:text-[11px] font-semibold text-slate-600 max-w-full">
-              {[1, 2, 4, 6, 12, 24].map(hours => (
-                <button
-                  key={hours}
-                  onClick={() => handleSetGridStepHours(hours)}
-                  className={cn(
-                    "px-1.5 py-0.5 rounded transition-all text-[10px]",
-                    gridStepHours === hours ? "bg-indigo-600 text-white shadow-2xs font-bold" : "hover:text-slate-900"
-                  )}
-                  title={L(`${hours}時間グリッド刻み`, `${hours}h grid granularity`, `Grille de ${hours}h`)}
-                >
-                  {hours}h
-                </button>
-              ))}
-            </div>
-          )}
-
-          {isGridEnabled && timelineMode === 'custom' && (
-            <div className="flex items-center flex-wrap bg-white border border-slate-200 rounded-lg p-0.5 text-[10px] sm:text-[11px] font-semibold text-slate-600 max-w-full">
-              <span className="px-1 text-[10px] text-slate-400 font-bold">{L('分割', 'Steps', 'Étapes')}:</span>
-              {[2, 3, 4, 5].map(subs => (
-                <button
-                  key={subs}
-                  onClick={() => handleSetStageSubdivisions(subs)}
-                  className={cn(
-                    "px-1.5 py-0.5 rounded transition-all text-[10px]",
-                    stageSubdivisions === subs ? "bg-indigo-600 text-white shadow-2xs font-bold" : "hover:text-slate-900"
-                  )}
-                  title={L(`各ステージを${subs}分割`, `${subs} subdivisions per stage`, `${subs} subdivisions par étape`)}
-                >
-                  {subs}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {/* Project Lanes Column Toggle (when in Fullscreen mode) */}
-          {isFullscreen && (
-            <button
-              type="button"
-              onClick={() => setShowLanesInFullscreen(prev => !prev)}
-              className={cn(
-                "px-2 sm:px-2.5 py-1 text-[10px] sm:text-[11px] font-semibold rounded-lg border transition-all flex items-center gap-1 sm:gap-1.5 shadow-2xs cursor-pointer",
-                showLanesInFullscreen
-                  ? "bg-indigo-50 text-indigo-700 border-indigo-200 font-bold"
-                  : "bg-white text-slate-500 border-slate-200 hover:bg-slate-50"
-              )}
-              title={L('全画面のままプロジェクトレーン列を表示/非表示', 'Toggle Project Lanes in Fullscreen', 'Afficher/masquer les couloirs de projets')}
-            >
-              <Folder size={12} className={showLanesInFullscreen ? "text-indigo-600" : "text-slate-400"} />
-              <span className="hidden sm:inline">{L('レーン', 'Lanes', 'Couloirs')}</span>
-              <span className={cn(
-                "text-[9px] px-1 py-0.5 rounded font-mono font-bold uppercase",
-                showLanesInFullscreen ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-500"
-              )}>
-                {showLanesInFullscreen ? 'ON' : 'OFF'}
-              </span>
-            </button>
-          )}
-
-          {/* Time Filter Button in Toolbar */}
-          <div className="relative inline-flex items-center" ref={timeFilterMenuRef}>
-            <button
-              type="button"
-              onClick={() => setIsTimeFilterOpen(prev => !prev)}
-              className={cn(
-                "px-2 sm:px-2.5 py-1 text-[10px] sm:text-[11px] font-bold rounded-lg border transition-all flex items-center gap-1 sm:gap-1.5 shadow-2xs cursor-pointer",
-                timeFilter.enabled
-                  ? "bg-indigo-600 text-white border-indigo-600 hover:bg-indigo-700 shadow-xs"
-                  : isTimeFilterOpen
-                    ? "bg-indigo-50 text-indigo-700 border-indigo-300 ring-1 ring-indigo-300"
-                    : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
-              )}
-              title={L('タスクの更新日時でタイムライン表示を絞り込み', 'Filter timeline tasks by updated date', 'Filtrer les tâches par date de mise à jour')}
-            >
-              <Clock size={12} className={timeFilter.enabled ? "text-white" : "text-indigo-600"} />
-              <span className="hidden sm:inline">
-                {timeFilter.enabled 
-                  ? `${L('更新', 'Updated', 'Modifié')}: ${getTimeFilterLabel(timeFilter)}`
-                  : L('更新日時', 'Time Filter', 'Filtre date')}
-              </span>
-              <span className="sm:hidden">
-                {timeFilter.enabled ? getTimeFilterLabel(timeFilter) : L('更新', 'Time', 'Date')}
-              </span>
-              {timeFilter.enabled && (
-                <span className="px-1 py-0.2 bg-white/20 text-white rounded text-[9px] font-mono">
-                  {activeTasks.length}/{allActiveTasks.length}
+            {/* 2. Phase Pattern Button */}
+            <div className="relative inline-flex items-center min-w-0 shrink">
+              <button
+                type="button"
+                data-dropdown-trigger="pattern"
+                onClick={(e) => {
+                  if (timelineMode !== 'custom') {
+                    handleSetTimelineMode('custom');
+                  }
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setPatternMenuTriggerRect(rect);
+                  setIsPatternMenuOpen(prev => !prev);
+                }}
+                className={cn(
+                  "px-2.5 sm:px-2.5 py-1.5 sm:py-1 text-xs sm:text-[11px] font-bold rounded-xl border transition-all flex items-center gap-1.5 shadow-2xs cursor-pointer select-none min-w-0 max-w-[145px] xs:max-w-[180px] sm:max-w-[220px] min-h-[36px] sm:min-h-[30px]",
+                  timelineMode === 'custom'
+                    ? "bg-indigo-50 border-indigo-200/90 text-indigo-900 hover:bg-indigo-100/70"
+                    : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+                )}
+                title={L('Phaseパターンを切り替え・管理', 'Switch & manage phase patterns', 'Gérer les modèles de phases')}
+              >
+                <Workflow size={15} className="text-indigo-600 shrink-0" />
+                <span className="truncate min-w-0 font-extrabold text-indigo-700">{activePattern.name}</span>
+                <span className="text-[10px] font-mono px-1.5 py-0.2 bg-indigo-200/70 text-indigo-800 rounded font-bold leading-tight hidden xs:inline shrink-0">
+                  {customColumns.length}{L('列', 'c', 'c')}
                 </span>
-              )}
-              <ChevronDown size={10} className={cn("transition-transform", isTimeFilterOpen && "rotate-180")} />
-            </button>
+                <ChevronDown size={13} className={cn("text-indigo-500 shrink-0 transition-transform duration-150", isPatternMenuOpen && "rotate-180")} />
+              </button>
+
+              {/* Dropdown Menu */}
+              {!isFullscreen && isPatternMenuOpen && renderPatternMenuDropdown()}
+            </div>
+
+            {/* 3. Time Filter Button on Timeline Top Toolbar (Dates/Phase, Phase patternボタンの横) */}
+            <div className="relative inline-flex items-center shrink-0">
+              <button
+                type="button"
+                data-dropdown-trigger="time-filter"
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setTimeFilterTriggerRect(rect);
+                  setIsTimeFilterOpen(prev => !prev);
+                }}
+                className={cn(
+                  "px-2 sm:px-2.5 py-1.5 sm:py-1 text-xs sm:text-[11px] font-bold rounded-xl border transition-all flex items-center gap-1.5 shadow-2xs cursor-pointer select-none shrink-0 min-h-[36px] sm:min-h-[30px]",
+                  timeFilter.enabled
+                    ? "bg-indigo-600 text-white border-indigo-600 shadow-xs"
+                    : isTimeFilterOpen
+                      ? "bg-indigo-50 text-indigo-700 border-indigo-200"
+                      : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 hover:text-indigo-600"
+                )}
+                title={L('Time filter（更新日時でタスクを絞り込み）', 'Time filter (Filter tasks by updated date)', 'Filtre temporel')}
+              >
+                <Clock size={14} className={cn("shrink-0", timeFilter.enabled ? "text-white" : "text-indigo-600")} />
+                <span className="font-bold">
+                  {timeFilter.enabled ? getTimeFilterLabel(timeFilter) : 'Time filter'}
+                </span>
+                {timeFilter.enabled && (
+                  <span className="text-[10px] bg-white/20 px-1 py-0.2 rounded font-mono font-bold shrink-0">
+                    {activeTasks.length}/{allActiveTasks.length}
+                  </span>
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* Right: 3. Menu Button ONLY */}
+          <div className="flex items-center gap-1.5 shrink-0">
+            <div className="relative inline-flex items-center">
+              <button
+                type="button"
+                data-dropdown-trigger="quick-menu"
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setQuickMenuTriggerRect(rect);
+                  setQuickMenuOrigin('toolbar');
+                  setIsQuickMenuOpen(prev => !prev);
+                }}
+                className={cn(
+                  "px-2.5 sm:px-3 py-1.5 sm:py-1 text-xs sm:text-[11px] font-bold rounded-xl border transition-all flex items-center gap-1.5 shadow-2xs cursor-pointer select-none shrink-0 min-h-[36px] sm:min-h-[30px]",
+                  isQuickMenuOpen && quickMenuOrigin === 'toolbar'
+                    ? "bg-indigo-600 text-white border-indigo-600 shadow-xs"
+                    : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 hover:text-indigo-600"
+                )}
+                title={L('メニュー（全機能の操作・設定）', 'Menu (All functions & settings)', 'Menu')}
+              >
+                <Menu size={16} className="shrink-0" />
+                <span className="font-semibold text-xs">{L('メニュー', 'Menu', 'Menu')}</span>
+              </button>
+
+              {/* Quick Menu Dropdown */}
+              {!isFullscreen && isQuickMenuOpen && quickMenuOrigin === 'toolbar' && renderQuickMenuDropdown('toolbar')}
+            </div>
+
+            {/* Time Filter Dropdown (Rendered when opened via Menu) */}
             {!isFullscreen && isTimeFilterOpen && renderTimeFilterDropdown()}
           </div>
-
-          {/* 3-Horizontal-Lines Menu Button (All Functions & Settings) */}
-          <div className="relative inline-flex items-center">
-            <button
-              type="button"
-              onClick={() => {
-                setQuickMenuOrigin('toolbar');
-                setIsQuickMenuOpen(prev => !prev);
-              }}
-              className={cn(
-                "px-2 sm:px-2.5 py-1 text-[10px] sm:text-[11px] font-bold rounded-lg border transition-all flex items-center gap-1 sm:gap-1.5 shadow-2xs cursor-pointer",
-                isQuickMenuOpen && quickMenuOrigin === 'toolbar'
-                  ? "bg-indigo-50 text-indigo-700 border-indigo-300 ring-1 ring-indigo-300"
-                  : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
-              )}
-              title={L('メニュー（全機能の操作・設定）', 'Menu (All functions & settings)', 'Menu (toutes les fonctions)')}
-            >
-              <Menu size={13} className="text-indigo-600 shrink-0" />
-              <span className="hidden sm:inline">{L('メニュー', 'Menu', 'Menu')}</span>
-            </button>
-            {isQuickMenuOpen && quickMenuOrigin === 'toolbar' && renderQuickMenuDropdown('toolbar')}
-          </div>
-
-          {/* Full View / Exit Full View Button */}
-          {onToggleFullscreen && (
-            <button
-              type="button"
-              onClick={onToggleFullscreen}
-              className={cn(
-                "px-2.5 sm:px-3 py-1 text-[10px] sm:text-[11px] font-bold rounded-lg border transition-all flex items-center gap-1 sm:gap-1.5 shadow-2xs cursor-pointer",
-                isFullscreen
-                  ? "bg-indigo-600 hover:bg-indigo-500 text-white border-indigo-600"
-                  : "bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200"
-              )}
-              title={isFullscreen
-                ? L('通常表示に戻す', 'Exit Full View', 'Quitter plein écran')
-                : L('タイムラインを全画面で表示 (Full view)', 'Enter Fullscreen Timeline (Full view)', 'Afficher la chronologie en plein écran')
-              }
-            >
-              {isFullscreen ? <Minimize2 size={12} className="shrink-0" /> : <Maximize2 size={12} className="shrink-0" />}
-              <span>{isFullscreen ? L('全画面終了', 'Exit Full View', 'Quitter') : L('Full view', 'Full view', 'Plein écran')}</span>
-            </button>
-          )}
         </div>
-      </div>
       )}
 
       {/* Timeline Grid Container */}
@@ -3722,8 +4173,8 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
             }}
             style={{ width: `${effectiveProjectColWidth}px` }}
             className={cn(
-              "shrink-0 px-2 sm:px-3 border-r border-slate-200 flex items-center justify-between text-[11px] font-black uppercase tracking-wider text-slate-600 bg-slate-100 sticky left-0 z-50 transition-colors group/projcol",
-              isFullscreen ? "py-1" : "py-2",
+              "shrink-0 px-2 sm:px-3 border-r border-slate-200 flex items-center justify-between text-xs sm:text-[11px] font-bold uppercase tracking-wider text-slate-700 bg-slate-100 sticky left-0 z-50 transition-colors group/projcol",
+              isFullscreen ? "py-1.5" : "py-2.5",
               isDragOverRootHeader && "bg-indigo-100 ring-2 ring-indigo-500 ring-inset"
             )}
             title={L("サブプロジェクトをここにドロップすると最上位プロジェクト化できます", "Drop subproject here to make it a top-level project", "Déposez un sous-projet ici pour en faire un projet racine")}
@@ -3745,7 +4196,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                 className="p-1 mr-2 text-slate-400 hover:text-indigo-600 hover:bg-slate-200/80 rounded transition-colors shrink-0"
                 title={L("プロジェクトフォルダを作成", "Add Project Folder", "Ajouter un dossier de projet")}
               >
-                <FolderPlus size={13} />
+                <FolderPlus size={15} />
               </button>
             )}
 
@@ -3772,16 +4223,16 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
           {effectiveShowUnscheduled && (
             <div 
               style={{ 
-                width: `${todoColWidth}px`,
+                width: `${todoColWidth}px`, 
                 left: hideSideColumns ? 0 : `${effectiveProjectColWidth}px`
               }}
               className={cn(
-                "shrink-0 px-2.5 border-r border-slate-200 bg-[#fffdf5] text-[11px] font-bold text-amber-800 flex items-center justify-between sticky z-40 group/todocol shadow-2xs",
-                isFullscreen ? "py-1" : "py-2"
+                "shrink-0 px-2.5 border-r border-slate-200 bg-[#fffdf5] text-xs sm:text-[11px] font-bold text-amber-900 flex items-center justify-between sticky z-40 group/todocol shadow-2xs",
+                isFullscreen ? "py-1.5" : "py-2.5"
               )}
             >
               <span className="flex items-center gap-1.5 font-bold truncate">
-                <ListTodo size={13} className="text-amber-600 shrink-0" />
+                <ListTodo size={15} className="text-amber-600 shrink-0" />
                 <span className="truncate">{L('ToDo リスト', 'ToDo List', 'Liste de tâches')}</span>
               </span>
 
@@ -3825,7 +4276,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                     key={date.toISOString()}
                     style={{ width: `${dayWidth}px` }}
                     className={cn(
-                      "shrink-0 border-r border-slate-300 select-none transition-colors flex flex-col justify-center",
+                      "shrink-0 border-r border-slate-300 select-none transition-colors flex flex-col justify-center group/datecol relative",
                       today && "bg-indigo-50/80 font-bold",
                       !today && isWeekend && "bg-slate-50 text-slate-500",
                       !today && !isWeekend && "bg-slate-100 text-slate-700"
@@ -3833,18 +4284,18 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                   >
                     <div className={cn(
                       "px-2 flex items-center justify-between",
-                      isFullscreen ? "py-0.5" : "py-1"
+                      isFullscreen ? "py-1" : "py-1.5"
                     )}>
                       <span className={cn(
-                        "text-[10px] uppercase font-bold leading-none",
-                        dayIdx === 0 ? "text-red-400" : dayIdx === 6 ? "text-indigo-400" : "text-slate-400"
+                        "text-[11px] sm:text-[10px] uppercase font-bold leading-none",
+                        dayIdx === 0 ? "text-red-500" : dayIdx === 6 ? "text-indigo-500" : "text-slate-500"
                       )}>
                         {dayOfWeek}
                       </span>
                       <span className={cn(
                         "font-mono font-bold px-1.5 rounded",
-                        isFullscreen ? "text-[11px] py-0" : "text-xs py-0.5",
-                        today ? "bg-indigo-600 text-white" : "text-slate-700"
+                        isFullscreen ? "text-xs py-0.5" : "text-xs py-0.5",
+                        today ? "bg-indigo-600 text-white shadow-2xs" : "text-slate-800"
                       )}>
                         {formattedMonthDay}
                       </span>
@@ -3868,6 +4319,23 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                         ))}
                       </div>
                     )}
+
+                    {/* Draggable resize handle on right edge */}
+                    <div
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        handleStartDateColResize(e.clientX);
+                      }}
+                      onTouchStart={(e) => {
+                        e.stopPropagation();
+                        handleStartDateColResize(e.touches[0].clientX);
+                      }}
+                      className="absolute right-0 top-0 bottom-0 w-2.5 cursor-col-resize hover:bg-indigo-500/50 active:bg-indigo-600 transition-colors z-30 flex items-center justify-center group-hover/datecol:bg-slate-300/60"
+                      title={L("ドラッグして日付列の幅を調整", "Drag to resize date column width", "Glisser pour ajuster la largeur de la colonne")}
+                    >
+                      <div className="w-0.5 h-3.5 bg-slate-400 rounded-full" />
+                    </div>
                   </div>
                 );
               })}
@@ -4097,11 +4565,11 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
 
             // Calculate minimum height required for unscheduled tasks column
             const unscheduledEstimatedHeight = effectiveShowUnscheduled && unscheduledTasks.length > 0
-              ? Math.max(56, unscheduledTasks.length * 34 + 14 + (quickAddCell?.project === project.fullPath && quickAddCell?.slotKey === 'backlog' ? 42 : 0))
-              : 56;
+              ? Math.max(58, unscheduledTasks.length * 38 + 16 + (quickAddCell?.project === project.fullPath && quickAddCell?.slotKey === 'backlog' ? 44 : 0))
+              : 58;
 
             const gridContentHeight = timelineMode === 'calendar' ? calendarLaneHeight : customLaneHeight;
-            const laneHeight = isCollapsed ? 34 : Math.max(54, gridContentHeight, unscheduledEstimatedHeight);
+            const laneHeight = isCollapsed ? 36 : Math.max(58, gridContentHeight, unscheduledEstimatedHeight);
 
             return (
               <div 
@@ -4121,12 +4589,12 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                         toggleProjectCollapse(project.fullPath);
                       }}
                       style={{ marginLeft: `${Math.max(4, project.level * 10 + 4)}px` }}
-                      className="pointer-events-auto mt-0.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900/65 hover:bg-indigo-600/90 text-white text-[10px] font-mono backdrop-blur-xs shadow-2xs transition-colors whitespace-nowrap leading-none"
+                      className="pointer-events-auto mt-1 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-900/80 hover:bg-indigo-600 text-white text-xs font-medium backdrop-blur-md shadow-xs transition-colors whitespace-nowrap leading-none cursor-pointer min-h-[28px]"
                       title={L(`${project.fullPath} (タップで折りたたみ/展開)`, `${project.fullPath} (Tap to collapse/expand)`, `${project.fullPath} (Appuyer pour réduire/développer)`)}
                     >
-                      {isCollapsed ? <ChevronRight size={10} /> : <ChevronDown size={10} />}
-                      <Folder size={9} className={project.level === 0 ? "text-indigo-300 shrink-0" : "text-amber-300 shrink-0"} />
-                      <span className="max-w-[130px] truncate">{project.name}</span>
+                      {isCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                      <Folder size={12} className={project.level === 0 ? "text-indigo-300 shrink-0" : "text-amber-300 shrink-0"} />
+                      <span className="max-w-[150px] truncate">{project.name}</span>
                     </button>
                   </div>
                 ) : (
@@ -4149,8 +4617,8 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                   style={{ width: `${effectiveProjectColWidth}px`, minHeight: `${laneHeight}px`, paddingLeft: `${Math.max(4, indentPx + 4)}px` }}
                   className={cn(
                     "shrink-0 px-1.5 sm:px-2 py-2 border-r border-slate-200 flex items-center justify-between bg-white sticky left-0 z-20 select-none transition-colors cursor-grab active:cursor-grabbing group/lane self-stretch",
-                    isCollapsed ? "min-h-[34px]" : "min-h-[54px]",
-                    project.level === 0 ? "font-bold text-slate-800" : "font-medium text-slate-600",
+                    isCollapsed ? "min-h-[36px]" : "min-h-[58px]",
+                    project.level === 0 ? "font-bold text-slate-800" : "font-medium text-slate-700",
                     dragOverProjectHeader === project.fullPath && "bg-indigo-50/90 ring-2 ring-indigo-500 ring-inset",
                     (selectedFolderPath === project.fullPath || selectedKey === `folder:${project.fullPath}` || activeTaskId === `folder:${project.fullPath}`) && "bg-indigo-50/90 ring-2 ring-indigo-500 ring-inset"
                   )}
@@ -4167,9 +4635,9 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                       toggleProjectCollapse(project.fullPath);
                       onSelectTask(`folder:${project.fullPath}`, true);
                     }}
-                    className="flex items-center gap-1 min-w-0 flex-1 overflow-hidden cursor-pointer hover:text-indigo-600 transition-colors"
+                    className="flex items-center gap-1.5 min-w-0 flex-1 overflow-hidden cursor-pointer hover:text-indigo-600 transition-colors"
                   >
-                    <GripVertical size={11} className="hidden sm:block text-slate-300 group-hover/lane:text-slate-500 shrink-0 mr-0.5 cursor-grab active:cursor-grabbing" />
+                    <GripVertical size={13} className="hidden sm:block text-slate-300 group-hover/lane:text-slate-500 shrink-0 mr-0.5 cursor-grab active:cursor-grabbing" />
                     <button
                       type="button"
                       onClick={(e) => {
@@ -4178,12 +4646,12 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                         setSelectedKey(`folder:${project.fullPath}`);
                         setSelectedFolderPath(project.fullPath);
                       }}
-                      className="p-0.5 text-slate-400 hover:text-slate-700 rounded transition-transform shrink-0"
+                      className="w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-slate-400 hover:text-slate-700 active:bg-slate-200/60 rounded-md transition-transform shrink-0 cursor-pointer"
                     >
-                      {isCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                      {isCollapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
                     </button>
 
-                    <Folder size={13} className={cn("shrink-0 transition-colors", project.level === 0 ? "text-indigo-600" : "text-amber-500")} />
+                    <Folder size={15} className={cn("shrink-0 transition-colors", project.level === 0 ? "text-indigo-600" : "text-amber-500")} />
 
                     {renamingItem?.type === 'folder' && renamingItem.idOrPath === project.fullPath ? (
                       <form 
@@ -4346,14 +4814,14 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                         });
                       }}
                       className={cn(
-                        "p-0.5 text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 rounded transition-opacity shrink-0 mr-1",
+                        "w-7 h-7 sm:w-6 sm:h-6 flex items-center justify-center text-slate-400 hover:text-slate-700 active:bg-slate-200/60 rounded-md transition-opacity shrink-0 mr-1 cursor-pointer",
                         activeMenu?.type === 'folder' && activeMenu.idOrPath === project.fullPath
                           ? "opacity-100 bg-slate-200/70 text-slate-800"
                           : "opacity-70 group-hover/lane:opacity-100"
                       )}
                       title={L("フォルダオプション", "Folder options", "Options du dossier")}
                     >
-                      <MoreHorizontal size={13} />
+                      <MoreHorizontal size={15} />
                     </button>
                   </div>
 
@@ -4742,59 +5210,37 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
       {/* Floating Fullscreen / Overall View Control Pill */}
       {onToggleFullscreen && (
         isFullscreen ? (
-          <div className="fixed bottom-2.5 right-2.5 z-[95] flex items-center gap-1 bg-slate-900/85 backdrop-blur-md text-white px-2 py-1 rounded-xl shadow-xl border border-white/15 select-none">
+          <div className="fixed bottom-[calc(0.625rem+env(safe-area-inset-bottom,0px))] left-2 right-2 sm:left-auto sm:right-2.5 z-[95] max-w-[calc(100vw-1rem)] flex items-center gap-1 bg-slate-900/90 backdrop-blur-md text-white px-2 py-1 rounded-xl shadow-xl border border-white/15 select-none overflow-x-auto overscroll-contain custom-scrollbar-none">
             {/* 3-Horizontal-Lines Menu Button in Floating Bar */}
-            <div className="relative inline-flex items-center">
+            <div className="relative inline-flex items-center shrink-0">
               <button
                 type="button"
-                onClick={() => {
+                data-dropdown-trigger="quick-menu"
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setQuickMenuTriggerRect(rect);
                   setQuickMenuOrigin('floating');
                   setIsQuickMenuOpen(prev => !prev);
                 }}
                 className={cn(
-                  "px-2 py-1.5 rounded-lg text-slate-200 hover:text-white hover:bg-white/15 transition-colors cursor-pointer flex items-center gap-1.5",
+                  "px-2.5 py-1.5 rounded-lg text-slate-200 hover:text-white hover:bg-white/15 transition-colors cursor-pointer flex items-center gap-1.5 shrink-0 min-h-[32px]",
                   isQuickMenuOpen && quickMenuOrigin === 'floating' && "bg-white/20 text-white"
                 )}
                 title={L('メニュー（全機能の操作・設定）', 'Menu (All functions & settings)', 'Menu')}
               >
-                <Menu size={13} />
-                <span className="text-[10px] font-bold">{L('メニュー', 'Menu', 'Menu')}</span>
+                <Menu size={15} className="shrink-0" />
+                <span className="text-xs font-bold shrink-0">{L('メニュー', 'Menu', 'Menu')}</span>
               </button>
               {isFullscreen && isQuickMenuOpen && quickMenuOrigin === 'floating' && renderQuickMenuDropdown('floating')}
             </div>
 
-            {/* Time Filter in Floating Bar */}
-            <div className="relative inline-flex items-center">
-              <button
-                type="button"
-                onClick={() => setIsTimeFilterOpen(prev => !prev)}
-                className={cn(
-                  "px-2 py-1.5 rounded-lg transition-colors cursor-pointer flex items-center gap-1 text-[10px] font-bold",
-                  timeFilter.enabled
-                    ? "bg-indigo-600 text-white shadow-xs"
-                    : isTimeFilterOpen
-                      ? "bg-white/20 text-white"
-                      : "text-slate-200 hover:text-white hover:bg-white/15"
-                )}
-                title={L('更新日時フィルター設定', 'Time Filter settings', 'Filtre de date')}
-              >
-                <Clock size={12} className={timeFilter.enabled ? "text-indigo-200" : "text-slate-300"} />
-                <span>{timeFilter.enabled ? getTimeFilterLabel(timeFilter) : L('期間', 'Time', 'Date')}</span>
-                {timeFilter.enabled && (
-                  <span className="text-[9px] bg-white/25 px-1 py-0.2 rounded font-mono">
-                    {activeTasks.length}/{allActiveTasks.length}
-                  </span>
-                )}
-              </button>
-              {isFullscreen && isTimeFilterOpen && renderTimeFilterDropdown()}
-            </div>
 
             {timelineMode === 'calendar' && (
-              <div className="flex items-center gap-0.5 pr-1 border-r border-white/20">
+              <div className="flex items-center gap-0.5 pr-1 border-r border-white/20 shrink-0">
                 <button
                   type="button"
                   onClick={() => handleNavigate('prev')}
-                  className="p-1 hover:bg-white/15 rounded text-slate-200 hover:text-white transition-colors"
+                  className="p-1 hover:bg-white/15 rounded text-slate-200 hover:text-white transition-colors shrink-0"
                   title={L('前の週へ', 'Previous week', 'Semaine précédente')}
                 >
                   <ChevronLeft size={13} />
@@ -4802,14 +5248,14 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                 <button
                   type="button"
                   onClick={() => handleNavigate('today')}
-                  className="px-1.5 py-0.5 text-[10px] font-bold text-indigo-300 hover:text-white hover:bg-white/15 rounded transition-colors"
+                  className="px-1.5 py-0.5 text-[10px] font-bold text-indigo-300 hover:text-white hover:bg-white/15 rounded transition-colors shrink-0"
                 >
                   {L('今日', 'Today', 'Auj.')}
                 </button>
                 <button
                   type="button"
                   onClick={() => handleNavigate('next')}
-                  className="p-1 hover:bg-white/15 rounded text-slate-200 hover:text-white transition-colors"
+                  className="p-1 hover:bg-white/15 rounded text-slate-200 hover:text-white transition-colors shrink-0"
                   title={L('次の週へ', 'Next week', 'Semaine suivante')}
                 >
                   <ChevronRight size={13} />
@@ -4818,22 +5264,27 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
             )}
 
             {timelineMode === 'custom' && (
-              <div className="relative inline-flex items-center">
+              <div className="relative inline-flex items-center shrink-0">
                 <button
                   type="button"
-                  onClick={() => setIsPatternMenuOpen(prev => !prev)}
-                  className="px-2 py-1 rounded-lg text-[10px] font-bold bg-indigo-600/90 hover:bg-indigo-600 text-white flex items-center gap-1 transition-colors cursor-pointer"
+                  data-dropdown-trigger="pattern"
+                  onClick={(e) => {
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    setPatternMenuTriggerRect(rect);
+                    setIsPatternMenuOpen(prev => !prev);
+                  }}
+                  className="px-2 py-1 rounded-lg text-[10px] font-bold bg-indigo-600/90 hover:bg-indigo-600 text-white flex items-center gap-1 transition-colors cursor-pointer shrink-0"
                   title={L('Phaseパターン切り替え・管理', 'Switch & manage phase patterns', 'Gérer les modèles')}
                 >
-                  <Workflow size={11} />
-                  <span className="max-w-[100px] truncate">{activePattern.name}</span>
-                  <ChevronDown size={10} className={cn("transition-transform duration-150", isPatternMenuOpen && "rotate-180")} />
+                  <Workflow size={11} className="shrink-0" />
+                  <span className="max-w-[70px] sm:max-w-[100px] truncate">{activePattern.name}</span>
+                  <ChevronDown size={10} className={cn("transition-transform duration-150 shrink-0", isPatternMenuOpen && "rotate-180")} />
                 </button>
 
                 <button
                   type="button"
                   onClick={handleAddColumn}
-                  className="p-1 hover:bg-white/15 rounded text-slate-200 hover:text-white transition-colors cursor-pointer ml-0.5"
+                  className="p-1 hover:bg-white/15 rounded text-slate-200 hover:text-white transition-colors cursor-pointer ml-0.5 shrink-0"
                   title={L(`「${activePattern.name}」にPhase列を追加`, `Add Phase column to "${activePattern.name}"`, `Ajouter une colonne`)}
                 >
                   <Plus size={12} />
@@ -4842,7 +5293,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                 <button
                   type="button"
                   onClick={() => handleResetCustomColumns('names_only')}
-                  className="p-1 hover:bg-white/15 rounded text-slate-200 hover:text-white transition-colors cursor-pointer"
+                  className="p-1 hover:bg-white/15 rounded text-slate-200 hover:text-white transition-colors cursor-pointer shrink-0"
                   title={L(`「${activePattern.name}」のPhase列名をデフォルト（Phase 1, 2, 3...）に再設定`, `Reset Phase column names to default (Phase 1, 2, 3...)`, `Réinitialiser les phases`)}
                 >
                   <RefreshCw size={11} />
@@ -4852,54 +5303,72 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
               </div>
             )}
 
-            <button
-              type="button"
-              onClick={() => setShowLanesInFullscreen(prev => !prev)}
-              className={cn(
-                "px-2 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-colors cursor-pointer",
-                showLanesInFullscreen
-                  ? "bg-indigo-600 text-white"
-                  : "text-slate-300 hover:text-white hover:bg-white/15"
-              )}
-              title={L('全画面のまま左側のプロジェクトレーン列を表示/非表示', 'Toggle Project Lanes column in Fullscreen', 'Afficher/masquer les couloirs de projets')}
-            >
-              <Folder size={11} />
-              <span>{L('レーン', 'Lanes', 'Couloirs')}</span>
-            </button>
+            {/* Time Filter Button in Fullscreen Toolbar */}
+            <div className="relative inline-flex items-center shrink-0">
+              <button
+                type="button"
+                data-dropdown-trigger="time-filter"
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setTimeFilterTriggerRect(rect);
+                  setIsTimeFilterOpen(prev => !prev);
+                }}
+                className={cn(
+                  "px-2.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shrink-0 min-h-[32px]",
+                  timeFilter.enabled
+                    ? "bg-indigo-600 text-white shadow-2xs"
+                    : "text-slate-300 hover:text-white hover:bg-white/15"
+                )}
+                title={L('Time filter（更新日時でタスクを絞り込み）', 'Time filter (Filter tasks by updated date)', 'Filtre temporel')}
+              >
+                <Clock size={13} className="shrink-0" />
+                <span className="shrink-0 font-bold">{timeFilter.enabled ? getTimeFilterLabel(timeFilter) : 'Time filter'}</span>
+                {timeFilter.enabled && (
+                  <span className="text-[10px] bg-white/20 px-1 py-0.2 rounded font-mono font-bold shrink-0">
+                    {activeTasks.length}/{allActiveTasks.length}
+                  </span>
+                )}
+              </button>
+              {isFullscreen && isTimeFilterOpen && renderTimeFilterDropdown()}
+            </div>
 
             <button
               type="button"
               onClick={() => setShowUnscheduledColumn(prev => !prev)}
               className={cn(
-                "px-2 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-colors cursor-pointer",
+                "px-2.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shrink-0 min-h-[32px]",
                 showUnscheduledColumn
-                  ? "bg-amber-600 text-white"
+                  ? "bg-amber-600 text-white shadow-2xs"
                   : "text-slate-300 hover:text-white hover:bg-white/15"
               )}
               title={L('ToDoリスト列を表示/非表示', 'Toggle ToDo List column', 'Afficher/masquer la colonne Liste de tâches')}
             >
-              <ListTodo size={11} />
-              <span>ToDo</span>
+              <ListTodo size={13} className="shrink-0" />
+              <span className="shrink-0">ToDo</span>
             </button>
 
             <button
               type="button"
               onClick={onToggleFullscreen}
-              className="px-2.5 py-1 rounded-lg bg-indigo-500 hover:bg-indigo-400 text-white text-[11px] font-bold flex items-center gap-1 shadow-xs transition-colors cursor-pointer"
+              className="px-3 py-1.5 rounded-lg bg-indigo-500 hover:bg-indigo-400 text-white text-xs font-bold flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer shrink-0 min-h-[32px]"
               title={L('全画面を終了して通常表示に戻す', 'Exit Full View', 'Quitter la vue plein écran')}
             >
-              <Minimize2 size={12} />
-              <span>{L('全画面終了', 'Exit Full View', 'Quitter')}</span>
+              <Minimize2 size={13} className="shrink-0" />
+              <span className="shrink-0 hidden xs:inline">{L('全画面終了', 'Exit Full View', 'Quitter')}</span>
+              <span className="shrink-0 xs:hidden">{L('終了', 'Exit', 'Quitter')}</span>
             </button>
           </div>
         ) : (
           <button
             type="button"
             onClick={onToggleFullscreen}
-            className="lg:hidden fixed bottom-18 right-2.5 z-[65] flex items-center gap-1.5 bg-slate-900/85 hover:bg-indigo-600 backdrop-blur-md text-white px-3 py-1.5 rounded-xl shadow-lg border border-white/15 text-[11px] font-bold transition-all cursor-pointer select-none"
+            className={cn(
+              "lg:hidden fixed bottom-18 right-2.5 z-[65] flex items-center gap-1.5 bg-slate-900/85 hover:bg-indigo-600 backdrop-blur-md text-white px-3.5 py-2 rounded-xl shadow-lg border border-white/15 text-xs font-bold transition-all cursor-pointer select-none min-h-[36px]",
+              (isQuickMenuOpen || isPatternMenuOpen || isTimeFilterOpen) && "hidden"
+            )}
             title={L('タイムラインを全画面で表示 (Full view)', 'Fullscreen Timeline (Full view)', 'Chronologie plein écran')}
           >
-            <Maximize2 size={13} />
+            <Maximize2 size={15} />
             <span>{L('Full view', 'Full view', 'Plein écran')}</span>
           </button>
         )
@@ -4927,8 +5396,9 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
           className={cn(
             "w-12 h-12 rounded-full bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white shadow-xl shadow-indigo-600/30 border border-indigo-400/30 flex items-center justify-center transition-all cursor-pointer select-none",
             isFullscreen
-              ? "fixed bottom-13 right-3.5 z-[95]"
-              : "fixed bottom-29 right-3.5 z-[66] lg:absolute lg:bottom-4 lg:right-4 lg:z-40"
+              ? "fixed bottom-[calc(3.85rem+env(safe-area-inset-bottom,0px))] right-3.5 z-[95]"
+              : "fixed bottom-29 right-3.5 z-[66] lg:absolute lg:bottom-4 lg:right-4 lg:z-40",
+            (isQuickMenuOpen || isPatternMenuOpen || isTimeFilterOpen) && (isFullscreen ? "hidden" : "max-lg:hidden")
           )}
           title={L('新規タスクを追加', 'Add New Task', 'Ajouter une nouvelle tâche')}
           aria-label={L('新規タスクを追加', 'Add New Task', 'Ajouter une nouvelle tâche')}
@@ -4975,12 +5445,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                 const name = newFolderName.trim();
                 if (!name) return;
                 const fullPath = targetParentFolder ? `${targetParentFolder}/${name}` : name;
-                const nextCustom = customFolders.includes(fullPath)
-                  ? customFolders
-                  : [...customFolders, fullPath];
-                saveCustomFolders(nextCustom);
-
-                // Set folder metadata to Focus (reviving if it was in Trash)
+                // Set folder metadata to Focus (reviving if it was in Trash) - called before saveCustomFolders so history snapshot captures prior state!
                 onUpdateFolderMeta?.(fullPath, {
                   category: 'Focus',
                   createdAt: Date.now(),
@@ -4993,9 +5458,14 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                 parts.forEach(p => {
                   cur = cur ? `${cur}/${p}` : p;
                   if (folderMetas?.[cur]?.category === 'Trash' || folderMetas?.[cur]?.category === 'Archive') {
-                    onUpdateFolderMeta?.(cur, { category: 'Focus', updatedAt: Date.now() });
+                    onUpdateFolderMeta?.(cur, { category: 'Focus', updatedAt: Date.now() }, { skipHistory: true });
                   }
                 });
+
+                const nextCustom = customFolders.includes(fullPath)
+                  ? customFolders
+                  : [...customFolders, fullPath];
+                saveCustomFolders(nextCustom);
 
                 // Auto expand parent and all its ancestors if collapsed
                 if (targetParentFolder) {
@@ -5409,7 +5879,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
     const isSelected = activeTaskId === task.id;
     const isUrgent = task.category === 'Urgent';
     const isDragTarget = dragOverTask?.taskId === task.id;
-    const deadlineAlert = getTaskDeadlineAlert(task.deadline, task.isDone, language);
+    const deadlineAlert = getTaskDeadlineAlert(task.deadline, task.isDone, language, task.isAllDay);
 
     return (
       <div
@@ -5452,7 +5922,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
           onSelectTask(task.id, true);
         }}
         className={cn(
-          "group/chip relative flex items-center gap-1.5 px-2 py-1 rounded-md text-xs cursor-grab active:cursor-grabbing transition-all shadow-2xs border select-none outline-none focus-visible:ring-2 focus-visible:ring-indigo-500",
+          "group/chip relative flex items-center gap-1.5 px-2.5 py-1.5 sm:px-2 sm:py-1 rounded-lg sm:rounded-md text-xs sm:text-xs min-h-[34px] sm:min-h-[28px] cursor-grab active:cursor-grabbing transition-all shadow-2xs border select-none outline-none focus-visible:ring-2 focus-visible:ring-indigo-500",
           isSelected 
             ? (task.isDone
                 ? "bg-slate-800 text-slate-200 border-slate-700 shadow-xs ring-2 ring-indigo-400/60"
@@ -5465,7 +5935,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
           isDragTarget && dragOverTask?.position === 'after' && "border-b-2 border-b-indigo-600 shadow-md"
         )}
       >
-        {/* Checkbox - Keep green checkmark visible even when selected */}
+        {/* Checkbox - iPhone Reminders style spacious touch target & clear circle */}
         <button
           type="button"
           onClick={(e) => {
@@ -5473,21 +5943,21 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
             onToggleDone(task.id);
           }}
           className={cn(
-            "shrink-0 transition-transform active:scale-95",
-            isSelected ? (task.isDone ? "text-emerald-500" : "text-white/80 hover:text-white") : "text-slate-400 hover:text-indigo-600"
+            "shrink-0 w-6 h-6 -ml-0.5 sm:-ml-0.5 flex items-center justify-center rounded-full transition-transform active:scale-90 cursor-pointer touch-manipulation",
+            isSelected ? (task.isDone ? "text-emerald-400" : "text-white/85 hover:text-white") : "text-slate-400 hover:text-indigo-600"
           )}
           title={task.isDone ? L("未完了に戻す", "Mark undone", "Marquer non terminé") : L("完了にする", "Mark done", "Marquer terminé")}
         >
           {task.isDone ? (
-            <CheckCircle2 size={12} className="text-emerald-500 shrink-0" />
+            <CheckCircle2 size={16} className="text-emerald-500 shrink-0" strokeWidth={2.2} />
           ) : (
-            <Circle size={12} className={isUrgent ? "text-red-500" : (isSelected && !task.isDone ? "text-white/60" : "text-slate-300")} />
+            <Circle size={16} className={isUrgent ? "text-red-500" : (isSelected && !task.isDone ? "text-white/75" : "text-slate-300 hover:text-slate-400")} strokeWidth={1.8} />
           )}
         </button>
 
         {/* Priority Dot */}
         {isUrgent && !task.isDone && (
-          <span className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" title="Focus" />
+          <span className="w-2 h-2 rounded-full bg-red-500 shrink-0" title="Focus" />
         )}
 
         {/* Task Title or Inline Rename Input */}
@@ -5507,7 +5977,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
                 e.stopPropagation();
                 if (e.key === 'Escape') setRenamingItem(null);
               }}
-              className="w-full bg-white text-slate-900 border border-indigo-400 rounded px-1.5 py-0.5 text-[11px] leading-tight outline-none shadow-xs font-sans font-normal focus:ring-1 focus:ring-indigo-400"
+              className="w-full bg-white text-slate-900 border border-indigo-400 rounded px-1.5 py-0.5 text-xs sm:text-[11px] leading-snug outline-none shadow-xs font-sans font-normal focus:ring-1 focus:ring-indigo-400"
             />
           </form>
         ) : (
@@ -5517,7 +5987,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
               startRenaming('task', task.id, task.title);
             }}
             className={cn(
-              "truncate flex-1 text-[11px] leading-tight cursor-text",
+              "truncate flex-1 text-xs sm:text-[11.5px] font-medium leading-snug cursor-text tracking-normal",
               task.isDone && "line-through opacity-75"
             )}
             title={L(`${task.title} (選択してEnterまたはダブルクリックで名前変更)`, `${task.title} (Select & Enter or double-click to rename)`, `${task.title} (Entrée ou double-clic pour renommer)`)}
@@ -5526,14 +5996,14 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
           </span>
         )}
 
-        {/* Approaching Deadline Highlight (Yellow clock mark, Red if overdue - icon only so title remains clear) */}
+        {/* Approaching Deadline Highlight (Yellow clock mark, Red if overdue) */}
         {!task.isDone && deadlineAlert && (
           <span
             className="shrink-0 inline-flex items-center justify-center ml-0.5"
             title={deadlineAlert.tooltip}
           >
             <Clock 
-              size={12} 
+              size={13} 
               className={cn(
                 "shrink-0",
                 isSelected
@@ -5555,7 +6025,7 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
             )}
           >
             <Repeat
-              size={11}
+              size={13}
               className={cn(
                 "shrink-0",
                 isSelected && !task.isDone ? "text-indigo-200" : "text-indigo-600"
@@ -5566,12 +6036,12 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
 
         {/* Star */}
         {task.isStarred && (
-          <Star size={10} fill="currentColor" className={isSelected && !task.isDone ? "text-amber-300 shrink-0" : "text-amber-400 shrink-0"} />
+          <Star size={13} fill="currentColor" className={isSelected && !task.isDone ? "text-amber-300 shrink-0" : "text-amber-400 shrink-0"} />
         )}
 
         {/* Pin */}
         {task.isPinned && (
-          <Pin size={10} fill="currentColor" className={isSelected && !task.isDone ? "text-indigo-200 shrink-0" : "text-indigo-500 shrink-0"} />
+          <Pin size={13} fill="currentColor" className={isSelected && !task.isDone ? "text-indigo-200 shrink-0" : "text-indigo-500 shrink-0"} />
         )}
 
         {/* 3-dots Menu Button right of task file name */}
@@ -5589,17 +6059,17 @@ export const ProjectTimelineView: React.FC<ProjectTimelineViewProps> = ({
               });
             }}
             className={cn(
-              "p-0.5 rounded transition-opacity shrink-0 ml-auto",
+              "w-6 h-6 flex items-center justify-center rounded-md p-0.5 transition-opacity shrink-0 ml-auto cursor-pointer touch-manipulation",
               isSelected && !task.isDone
-                ? "text-white/85 hover:text-white hover:bg-white/20"
-                : "text-slate-400 hover:text-slate-700 hover:bg-slate-200/70",
+                ? "text-white/85 hover:text-white hover:bg-white/20 active:bg-white/30"
+                : "text-slate-400 hover:text-slate-700 hover:bg-slate-200/70 active:bg-slate-200",
               (activeMenu?.type === 'task' && activeMenu.idOrPath === task.id) || isSelected
                 ? "opacity-100"
                 : "opacity-70 group-hover/chip:opacity-100"
             )}
             title={L("タスクオプション", "Task options", "Options de la tâche")}
           >
-            <MoreHorizontal size={12} />
+            <MoreHorizontal size={14} />
           </button>
         )}
       </div>

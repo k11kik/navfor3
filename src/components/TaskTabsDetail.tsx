@@ -231,6 +231,8 @@ const SinglePane: React.FC<SinglePaneProps> = ({
 
   // Track focus and unsaved edits so typing in Notes/Title never triggers mid-typing backups or cursor jumps
   const isTitleFocusedRef = useRef(false);
+  const isTitleComposingRef = useRef(false);
+  const lastTitleCompositionEndRef = useRef(0);
   const isNotesFocusedRef = useRef(false);
   const syncedTaskIdRef = useRef<string | null>(null);
   const lastSavedTitleRef = useRef<string>('');
@@ -363,7 +365,11 @@ const SinglePane: React.FC<SinglePaneProps> = ({
     if (!activeTask) return;
     dirtyTitleRef.current = null;
     const trimmed = newTitle.trim();
-    if (!trimmed || trimmed === lastSavedTitleRef.current) return;
+    if (!trimmed) {
+      setTitle(lastSavedTitleRef.current || activeTask.title || '');
+      return;
+    }
+    if (trimmed === lastSavedTitleRef.current) return;
     lastSavedTitleRef.current = trimmed;
     onPinTab(activeTask.id); // Promotes to permanent on edit
     onUpdateTask(activeTask.id, { title: trimmed });
@@ -769,11 +775,18 @@ const SinglePane: React.FC<SinglePaneProps> = ({
                 <button
                   type="button"
                   onClick={(e) => {
+                    e.preventDefault();
                     e.stopPropagation();
                     onCloseTab(item.id);
                   }}
-                  className="ml-0.5 p-0.5 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-200/80 transition-colors opacity-70 group-hover:opacity-100 not-italic"
+                  onTouchEnd={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onCloseTab(item.id);
+                  }}
+                  className="ml-0.5 p-1 sm:p-0.5 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-200/80 transition-colors opacity-80 sm:opacity-70 group-hover:opacity-100 not-italic cursor-pointer touch-manipulation flex items-center justify-center min-w-[20px] min-h-[20px]"
                   title={L('閉じる (中クリックでも可)', 'Close', 'Fermer')}
+                  aria-label={L('タブを閉じる', 'Close tab', 'Fermer l’onglet')}
                 >
                   <X size={12} />
                 </button>
@@ -939,17 +952,33 @@ const SinglePane: React.FC<SinglePaneProps> = ({
                     setTitle(nextVal);
                     if (nextVal.trim() !== lastSavedTitleRef.current) {
                       dirtyTitleRef.current = { taskId: activeTask.id, value: nextVal };
-                      onPinTab(activeTask.id);
                     } else {
                       dirtyTitleRef.current = null;
                     }
                   }}
+                  onCompositionStart={() => {
+                    isTitleComposingRef.current = true;
+                  }}
+                  onCompositionEnd={() => {
+                    isTitleComposingRef.current = false;
+                    lastTitleCompositionEndRef.current = Date.now();
+                  }}
                   onBlur={() => {
                     isTitleFocusedRef.current = false;
+                    isTitleComposingRef.current = false;
                     saveTitle(title);
                   }}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') {
+                      if (
+                        isTitleComposingRef.current ||
+                        e.nativeEvent.isComposing ||
+                        (e as any).isComposing ||
+                        e.keyCode === 229 ||
+                        Date.now() - lastTitleCompositionEndRef.current < 200
+                      ) {
+                        return; // IME composition / kanji conversion in progress: do not save or blur!
+                      }
                       e.preventDefault();
                       saveTitle(title);
                       (e.target as HTMLTextAreaElement).blur();
@@ -1604,6 +1633,9 @@ export const TaskTabsDetail: React.FC<TaskTabsDetailProps> = ({
   // Layout State (single, split-right, split-down, grid-2x2)
   const [layout, setLayout] = useState<SplitLayoutType>(() => {
     try {
+      if (typeof window !== 'undefined' && window.innerWidth < 1024) {
+        return 'single';
+      }
       const saved = localStorage.getItem('navfor_editor_layout');
       if (saved === 'split-right' || saved === 'split-down' || saved === 'grid-2x2') {
         return saved;
@@ -1623,8 +1655,17 @@ export const TaskTabsDetail: React.FC<TaskTabsDetailProps> = ({
       openTaskIds.length > 0 ? openTaskIds : (activeTaskId ? [activeTaskId] : [])
     );
 
+    if (currentValidIds.size === 0) {
+      return [
+        { id: 0, openTaskIds: [], activeTaskId: null, previewTaskId: null },
+        { id: 1, openTaskIds: [], activeTaskId: null, previewTaskId: null },
+        { id: 2, openTaskIds: [], activeTaskId: null, previewTaskId: null },
+        { id: 3, openTaskIds: [], activeTaskId: null, previewTaskId: null },
+      ];
+    }
+
     try {
-      const saved = localStorage.getItem(panesStorageKey) || (activeSection === 'General' ? localStorage.getItem('navfor_editor_panes') : null);
+      const saved = localStorage.getItem(panesStorageKey);
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length >= 4) {
@@ -1693,13 +1734,17 @@ export const TaskTabsDetail: React.FC<TaskTabsDetailProps> = ({
       localStorage.setItem('navfor_split_x_ratio', String(splitXRatio));
       localStorage.setItem('navfor_split_y_ratio', String(splitYRatio));
       const allOpenIds = Array.from(new Set(panes.flatMap(p => p.openTaskIds)));
-      if (allOpenIds.length > 0 && onOpenTaskIdsChange) {
+      if (onOpenTaskIdsChange) {
         onOpenTaskIdsChange(allOpenIds);
+      }
+      localStorage.setItem(openTabsStorageKey, JSON.stringify(allOpenIds));
+      if (allOpenIds.length === 0) {
+        localStorage.removeItem(activeTabStorageKey);
       }
     } catch (e) {
       console.error(e);
     }
-  }, [layout, panes, splitXRatio, splitYRatio, panesStorageKey]);
+  }, [layout, panes, splitXRatio, splitYRatio, panesStorageKey, openTabsStorageKey, activeTabStorageKey]);
 
   // Synchronize incoming activeTaskId & lastOpenEvent from props (e.g. from Explorer, Timeline, Focus click)
   const prevActiveTaskIdRef = useRef<string | null>(null);
@@ -1797,6 +1842,16 @@ export const TaskTabsDetail: React.FC<TaskTabsDetailProps> = ({
       localStorage.setItem(openTabsStorageKey, '[]');
       localStorage.removeItem(activeTabStorageKey);
       localStorage.setItem(panesStorageKey, JSON.stringify(emptyPanes));
+      localStorage.removeItem('navfor_open_tabs');
+      localStorage.removeItem('navfor_active_tab');
+      localStorage.removeItem('navfor_editor_panes');
+      localStorage.setItem(`navfor_open_tabs_${activeSection}`, '[]');
+      localStorage.removeItem(`navfor_active_tab_${activeSection}`);
+      localStorage.setItem(`navfor_editor_panes_${activeSection}`, JSON.stringify(emptyPanes));
+      localStorage.setItem('navfor_open_tabs_General', '[]');
+      localStorage.removeItem('navfor_active_tab_General');
+      localStorage.setItem('navfor_editor_panes_General', JSON.stringify(emptyPanes));
+      localStorage.setItem('navfor_detail_visible', 'false');
     } catch (e) {
       console.error(e);
     }
@@ -1959,7 +2014,7 @@ export const TaskTabsDetail: React.FC<TaskTabsDetailProps> = ({
     }
 
     setPanes(prev => {
-      return prev.map(p => {
+      const updated = prev.map(p => {
         if (p.id !== paneId) return p;
         const nextOpen = p.openTaskIds.filter(id => id !== taskId);
         let nextActive = p.activeTaskId;
@@ -1974,6 +2029,20 @@ export const TaskTabsDetail: React.FC<TaskTabsDetailProps> = ({
           previewTaskId: p.previewTaskId === taskId ? null : p.previewTaskId
         };
       });
+
+      const nextAllOpen = Array.from(new Set(updated.flatMap(p => p.openTaskIds)));
+      if (onOpenTaskIdsChange) {
+        onOpenTaskIdsChange(nextAllOpen);
+      }
+      try {
+        localStorage.setItem(panesStorageKey, JSON.stringify(updated));
+        localStorage.setItem(openTabsStorageKey, JSON.stringify(nextAllOpen));
+        if (nextActiveForParent) {
+          localStorage.setItem(activeTabStorageKey, nextActiveForParent);
+        }
+      } catch (e) {}
+
+      return updated;
     });
 
     if (nextActiveForParent && onSelectTask) {
@@ -2426,8 +2495,8 @@ export const TaskTabsDetail: React.FC<TaskTabsDetailProps> = ({
               {L('詳細', 'Details', 'Détails')}
             </span>
 
-            {/* Layout Quick Selector */}
-            <div className="flex items-center bg-slate-100 rounded p-0.5 ml-2 gap-0.5">
+            {/* Layout Quick Selector (Desktop only) */}
+            <div className="hidden lg:flex items-center bg-slate-100 rounded p-0.5 ml-2 gap-0.5">
               <button
                 type="button"
                 onClick={handleSingleLayout}
@@ -2475,7 +2544,7 @@ export const TaskTabsDetail: React.FC<TaskTabsDetailProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center gap-0.5">
+          <div className="flex items-center gap-1">
             {/* 1. Minimize / Hide Detail Pane (keeps tabs intact) */}
             <button
               type="button"
@@ -2489,21 +2558,21 @@ export const TaskTabsDetail: React.FC<TaskTabsDetailProps> = ({
                 }
                 (onMinimize || onClose)();
               }}
-              className="p-1 hover:bg-slate-100 text-slate-400 hover:text-slate-700 rounded transition-colors"
+              className="p-1.5 lg:p-1 hover:bg-slate-100 text-slate-400 hover:text-slate-700 rounded-md transition-colors flex items-center justify-center cursor-pointer"
               title={L('詳細ペインを最小化 (タブを保持)', 'Minimize detail pane (keep tabs)', 'Réduire le panneau (conserver les onglets)')}
               aria-label={L('詳細ペインを最小化', 'Minimize detail pane', 'Réduire le panneau')}
             >
-              <Minus size={15} />
+              <Minus size={18} className="lg:w-[15px] lg:h-[15px]" />
             </button>
-            {/* 2. Close All Tabs (clears tabs and closes Task Detail) */}
+            {/* 2. Close All Tabs (clears tabs and completely closes Task Detail) */}
             <button
               type="button"
               onClick={handleCloseAllTabs}
-              className="p-1 hover:bg-red-50 text-slate-400 hover:text-red-600 rounded transition-colors"
-              title={L('すべてのタブを閉じる (タブを消去して閉じる)', 'Close all tabs (clear tabs and close)', 'Fermer tous les onglets')}
-              aria-label={L('すべてのタブを閉じる', 'Close all tabs', 'Fermer tous les onglets')}
+              className="p-1.5 lg:p-1 hover:bg-red-50 text-slate-400 hover:text-red-600 rounded-md transition-colors"
+              title={L('閉じる', 'Close', 'Fermer')}
+              aria-label={L('閉じる', 'Close', 'Fermer')}
             >
-              <X size={15} />
+              <X size={18} className="lg:w-[15px] lg:h-[15px]" />
             </button>
           </div>
         </div>
